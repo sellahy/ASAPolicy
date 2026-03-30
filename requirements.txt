@@ -1,0 +1,6 @@
+gymnasium
+torch
+wandb
+-e ./chess_env
+numpy
+typing
