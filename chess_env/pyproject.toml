@@ -8,7 +8,10 @@ version = "0.0.1"
 dependencies = [
   "gymnasium",
   "numpy",
-  "Optional",
+  "torch>=2.0",
+  "wandb",
+  "matplotlib",
+  "pandas",
   "pre-commit",
 ]
 
@@ -16,4 +19,4 @@ dependencies = [
 path = "__about__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["__about__.py"]
+packages = ["chess_env"]

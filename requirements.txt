@@ -1,6 +1,7 @@
 gymnasium
-torch
+torch>=2.0
 wandb
+matplotlib
+pandas
 -e ./chess_env
 numpy
-typing

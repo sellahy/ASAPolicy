@@ -1,0 +1,44 @@
+# sweep_config.yaml
+#
+# W&B Bayesian hyperparameter sweep for the ASA policy experiment.
+#
+# The optimization target is asa_agent/KingWorld-v0/return. This key must
+# exactly match a key passed to wandb.log() in ppo_clip.py. Because all
+# metrics are logged under per-agent, per-environment namespaces
+# (e.g. asa_agent/KingWorld-v0/return), there is no key simply called
+# "return". Changing the target environment is valid and affects which part
+# of the hyperparameter space Bayesian optimization will favor.
+#
+# To initialize:
+#   wandb sweep sweep_config.yaml
+#   → prints a sweep ID, e.g. entity/chess_asa/abc123
+#
+# To launch agents (one per GPU):
+#   NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)
+#   for i in $(seq 0 $((NUM_GPUS - 1))); do
+#     CUDA_VISIBLE_DEVICES=$i wandb agent entity/chess_asa/abc123 &
+#   done
+#   wait
+
+program: run_experiment.py
+method: bayes
+metric:
+  name: asa_agent/KingWorld-v0/return
+  goal: maximize
+parameters:
+  total_timesteps:
+    values: [100000, 300000, 1000000]
+  gamma:
+    values: [0.95, 0.99, 0.999]
+  ppo_lr:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.01
+  latent_action_dim:
+    values: [2, 3, 5, 8]
+  dim_feedforward:
+    values: [32, 64, 128, 256]
+  idm_latent_dim:
+    values: [2, 3, 5]
+  seed:
+    values: [0, 1, 2, 3]
