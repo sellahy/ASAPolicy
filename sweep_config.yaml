@@ -21,13 +21,17 @@
 #   wait
 
 program: run_experiment.py
-method: bayes
+method: grid
 metric:
   name: asa_agent/KingWorld-v0/return
   goal: maximize
 parameters:
+  width:
+    values: [5, 10, 15]
+  height:
+    values: [5, 10, 15]
   total_timesteps:
-    values: [100000, 300000, 1000000]
+    values: [40000, 80000, 160000]
   gamma:
     values: [0.95, 0.99, 0.999]
   ppo_lr:
