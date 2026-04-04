@@ -490,8 +490,10 @@ def _train_worker(gpu_id: int, config: dict, agent_spec: dict,
     wandb.init(
         project=config.get("project_name", "chess_asa"),
         entity=config.get("wandb_entity"),
-        id=run_id,
-        resume="allow",
+        group=run_id,
+        job_type=agent_spec["agent_name"],
+        config=config,
+        resume="allow"
     )
 
     envs: list[gym.Env] = [
@@ -607,7 +609,7 @@ def run_all_agents(config: dict, run_dir: str) -> None:
     """
     num_gpus: int = torch.cuda.device_count() or 1  # fall back to CPU if no GPUs
 
-    all_env_names: list[str] = config["training_envs"]
+    all_env_names: list[str] = config["all_envs"]
     asa_env_names: list[str] = config["asa_envs"]
 
     # One baseline agent per environment
@@ -665,7 +667,7 @@ def run_asa_transfer(config: dict, run_dir: str) -> None:
     num_gpus: int = torch.cuda.device_count() or 1
 
     unseen_envs: list[str] = [
-        name for name in config["training_envs"]
+        name for name in config["all_envs"]
         if name not in config["asa_envs"]
     ]
 

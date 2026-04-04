@@ -3,6 +3,16 @@ idm_training_config_dict: dict = {
     "epochs":         100,
     "lr":             1e-03,
     "batch_size":     128,
+    "all_envs" : [
+        "chess_env/ChessWorld-v0",
+        "chess_env/BishopWorld-v0",
+        "chess_env/CamelWorld-v0",
+        "chess_env/GoldGeneralWorld-v0",
+        "chess_env/KingWorld-v0",
+        "chess_env/KnightWorld-v0",
+        "chess_env/SilverGeneralWorld-v0",
+        "chess_env/ZebraWorld-v0",
+    ],
     # Names of environments used for IDM training (passed to gym.make).
     # All environments listed here will have a per-environment decoder trained
     # alongside the shared IDM encoder.
@@ -15,22 +25,9 @@ idm_training_config_dict: dict = {
     "dataset_size":   12800,
     "width":          5,
     "height":         5,
-    "project_name":   "simple_idm",
+    "project_name":   "action_space_agnostic_agent",
     "wandb_entity":   "sellahy-university-of-maryland-at-college-park",
     "idm_latent_dim": 3,  # latent dimension of the shared IDM encoder
-}
-
-policy_training_config_dict: dict = {
-    "wandb_entity":   "sellahy-university-of-maryland-at-college-park",
-    "project_name":   "simple_policy",
-    "training_envs":  ["chess_env/KingWorld-v0", "chess_env/KnightWorld-v0"],
-    "jumpstart_envs": ["chess_env/SilverGeneralWorld-v0", "chess_env/ZebraWorld-v0"],
-    "width":          5,
-    "height":         5,
-    "gamma":          0.99,
-    "clip_epsilon":   0.2,
-    "lr":             0.001,
-    "epochs":         200,
 }
 
 ppo_config_dict: dict = {
@@ -51,15 +48,9 @@ ppo_config_dict: dict = {
     "dim_feedforward":    64,
 
     # Environments the ASA agent trains on.
-    # Must be a proper subset of idm_training_config_dict["training_envs"] so
-    # that at least one environment is held out for transfer evaluation.
-    # GoldGeneralWorld (7 actions) is intentionally excluded so the transfer
-    # stage tests generalization to an unseen action space size.
-    "asa_envs": [
-        "chess_env/ChessWorld-v0",
-        "chess_env/BishopWorld-v0",
-        "chess_env/CamelWorld-v0",
-    ],
+    # Must be the same environments that the IDM saw. That is, it is 
+    # equivalent to idm_training_config_dict["training_envs"].
+    "asa_envs": idm_training_config_dict["training_envs"],
 
     # Metric / plotting config consumed by plot_results.py
     "jumpstart_K":           100,   # initial eval events that define jumpstart
@@ -69,7 +60,7 @@ ppo_config_dict: dict = {
 
 # Guard against accidental key collisions before merging.
 # If a key appears in both dicts, the merge would silently overwrite the
-# idm value, which is almost certainly a bug.
+# idm value
 _overlap: set = set(idm_training_config_dict) & set(ppo_config_dict)
 assert not _overlap, (
     f"ppo_config_dict redefines keys already in idm_training_config_dict: {_overlap}. "
