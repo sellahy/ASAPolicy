@@ -20,11 +20,12 @@
 #   done
 #   wait
 
-program: run_experiment.py
+program: 
+  run_experiment.py
 method: grid
-metric:
-  name: asa_agent/KingWorld-v0/return
-  goal: maximize
+# metric:
+#   name: asa_agent/KingWorld-v0/return
+#   goal: maximize
 parameters:
   width:
     values: [5, 10, 15]
@@ -35,14 +36,22 @@ parameters:
   gamma:
     values: [0.95, 0.99, 0.999]
   ppo_lr:
-    distribution: log_uniform_values
-    min: 0.0001
-    max: 0.01
+    values: [0.01, 0.001, 0.0001]
+    # distribution: log_uniform_values
+    # min: 0.0001
+    # max: 0.01
   latent_action_dim:
     values: [2, 3, 5, 8]
   dim_feedforward:
-    values: [32, 64, 128, 256]
+    values: [32, 64, 128, 256] # this is wrong. It needs to be changed so that the ASAPolicy has a similar parameter count to the baseline agents
   idm_latent_dim:
     values: [2, 3, 5]
   seed:
     values: [0, 1, 2, 3]
+command:
+  - ${env}
+  - python
+  - ${program}
+  - "--sweep"
+  - "--skip-plot"
+  - "--force"
