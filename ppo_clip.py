@@ -1,3 +1,4 @@
+import time
 from random import randrange
 from typing import Optional
 from pathlib import Path
@@ -353,9 +354,9 @@ def ppo_clip(policy_net: nn.Module, value_net: nn.Module,
         # Calculate advantages
         if is_asa:
             env_ids_tensor: torch.Tensor = torch.cat(env_ids, dim=0)  # (T, num_asa_envs)
-            values: torch.Tensor = value_net(states_tensor, env_ids_tensor).squeeze()
+            values: torch.Tensor = value_net(states_tensor, env_ids_tensor).squeeze(-1)
         else:
-            values = value_net(states_tensor).squeeze()
+            values = value_net(states_tensor).squeeze(-1)
 
         advantages: torch.Tensor = returns_tensor - values.detach()
 
@@ -462,7 +463,7 @@ def evaluate(policy: nn.Module, env: gym.Env, n_episodes: int,
 # Multi-process training workers
 # ---------------------------------------------------------------------------
 
-def _train_worker(gpu_id: int, config: dict, agent_spec: dict,
+def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
                   run_id: str, run_dir: str) -> None:
     """Worker function executed in a child process for one agent.
 
@@ -481,6 +482,9 @@ def _train_worker(gpu_id: int, config: dict, agent_spec: dict,
                     aggregated on one run page.
         run_dir:    Local directory for saving model checkpoints.
     """
+
+    # time.sleep(rank_id * 120) # stagger wandb.inits between instances of _train_worker
+
     device: torch.device = torch.device(
         f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
     )
@@ -488,12 +492,13 @@ def _train_worker(gpu_id: int, config: dict, agent_spec: dict,
 
     # Join the parent W&B run so all agents log to the same run
     wandb.init(
-        project=config.get("project_name", "chess_asa"),
+        project=config.get("project_name"),
         entity=config.get("wandb_entity"),
         group=run_id,
         job_type=agent_spec["agent_name"],
         config=config,
-        resume="allow"
+        resume="allow",
+        # settings=wandb.Settings(init_timeout=120)
     )
 
     envs: list[gym.Env] = [
@@ -514,6 +519,8 @@ def _train_worker(gpu_id: int, config: dict, agent_spec: dict,
 
     elif agent_spec["type"] == "asa":
         idm: Encoder = Encoder(
+            height=config["height"],
+            width=config["width"],
             input_dim=state_dim,
             latent_dim=config["idm_latent_dim"]
         ).to(device)
@@ -546,6 +553,8 @@ def _train_worker(gpu_id: int, config: dict, agent_spec: dict,
 
     elif agent_spec["type"] == "asa_transfer":
         idm = Encoder(
+            height=config["height"],
+            width=config["width"],
             input_dim=state_dim,
             latent_dim=config["idm_latent_dim"]
         ).to(device)
@@ -607,6 +616,8 @@ def run_all_agents(config: dict, run_dir: str) -> None:
         config:  Full experiment config dict.
         run_dir: Directory containing idm.pt and where checkpoints are saved.
     """
+    wandb.setup() # used because _train_worker initiates a run in a spawned instance (see https://docs.wandb.ai/models/track/log/distributed-training)
+
     num_gpus: int = torch.cuda.device_count() or 1  # fall back to CPU if no GPUs
 
     all_env_names: list[str] = config["all_envs"]
@@ -637,7 +648,7 @@ def run_all_agents(config: dict, run_dir: str) -> None:
         gpu_id: int = rank % num_gpus
         p = mp.Process(
             target=_train_worker,
-            args=(gpu_id, config, spec, run_id, run_dir)
+            args=(gpu_id, rank, config, spec, run_id, run_dir)
         )
         p.start()
         processes.append(p)
@@ -664,6 +675,8 @@ def run_asa_transfer(config: dict, run_dir: str) -> None:
         config:  Full experiment config dict.
         run_dir: Directory containing asa_agent_policy.pt and idm.pt.
     """
+    wandb.setup() # used because _train_worker initiates a run in a spawned instance (see https://docs.wandb.ai/models/track/log/distributed-training)
+    
     num_gpus: int = torch.cuda.device_count() or 1
 
     unseen_envs: list[str] = [
@@ -687,7 +700,7 @@ def run_asa_transfer(config: dict, run_dir: str) -> None:
         gpu_id: int = rank % num_gpus
         p = mp.Process(
             target=_train_worker,
-            args=(gpu_id, config, spec, run_id, str(run_dir))
+            args=(gpu_id, rank, config, spec, run_id, str(run_dir))
         )
         p.start()
         processes.append(p)
