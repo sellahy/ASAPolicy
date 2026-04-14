@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 import wandb
 import gymnasium as gym
 import chess_env
-from config import idm_training_config_dict as config
+from config import idm_training_config_dict as config # FIXME: may want to remove this just to make sure IDM and decoder use the correct config. Current use of cfg because config isn't available is inconsistent with ppo_clip.py
 from math import sqrt
 from random import randint
 
@@ -97,10 +97,12 @@ class ChessDataset(Dataset):
         return (torch.unsqueeze(datum, 0), env.spec.id)  # shape (1, 2, height, width)
 
 class Encoder(nn.Module):
-    def __init__(self, input_dim: int = config["height"]*config["width"],
-                 latent_dim: int = 3):  # for chessworld, latent dim should be < 4 because transition can be exactly determined by 4 numbers
+    def __init__(self, height : int = config["height"], width : int = config["width"], 
+                 input_dim: int = config["height"]*config["width"], latent_dim: int = 3):  # for chessworld envs, latent dim should be < 4 because transition can be exactly determined by 4 numbers
         super(Encoder, self).__init__()
 
+        self.height = height
+        self.width = width
         self.input_dim: int = input_dim   # width by height
         self.latent_dim: int = latent_dim  # dimension of latent embedding
 
@@ -115,7 +117,7 @@ class Encoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Expect input with shape (batch_size, 2, height, width). Output will have shape (batch_size, latent_dim)"""
-        assert x.shape[x.dim()-3:x.dim()] == (2, int(sqrt(self.input_dim)), int(sqrt(self.input_dim))), f"expected input to have shape (batch_size, 2, {int(sqrt(self.input_dim))}, {int(sqrt(self.input_dim))}), but got {x.shape}"
+        assert x.shape[x.dim()-3:x.dim()] == (2, self.height, self.width), f"expected input to have shape (batch_size, 2, {self.height}, {self.width}), but got {x.shape}"
 
         # add explicit batch dim if not present
         if x.dim() == 3:
@@ -133,10 +135,13 @@ class Encoder(nn.Module):
         return latent
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim: int = 3,  # for chessworld, latent dim should be < 4 because transition can be exactly determined by 4 numbers
+    def __init__(self, latent_dim: int = 3, # for chessworld, latent dim should be < 4 because transition can be exactly determined by 4 numbers
+                 height : int = config["height"], width : int = config["width"], 
                  output_dim: int = config["height"]*config["width"]):
         super(Decoder, self).__init__()
 
+        self.height = height
+        self.width = width
         self.latent_dim: int = latent_dim   # dimension of latent embedding
         self.output_dim: int = output_dim   # width by height
 
@@ -162,8 +167,8 @@ class Decoder(nn.Module):
         reconstructed: torch.Tensor = self.decoder(latent)
 
         # Reshape to original dimensions
-        reconstructed = reconstructed.view(-1, 2, int(sqrt(self.output_dim)), int(sqrt(self.output_dim)))
-        assert reconstructed.shape == (batch_size, 2, int(sqrt(self.output_dim)), int(sqrt(self.output_dim))), f"expected reconstructed to have shape (batch_size, 2, height, width) = ({batch_size}, 2, {int(sqrt(self.output_dim))}, {int(sqrt(self.output_dim))}), but got {reconstructed.shape}"
+        reconstructed = reconstructed.view(-1, 2, self.height, self.width)
+        assert reconstructed.shape == (batch_size, 2, self.height, self.width), f"expected reconstructed to have shape (batch_size, 2, height, width) = ({batch_size}, 2, {self.height}, {self.width}), but got {reconstructed.shape}"
         return reconstructed
 
 # train IDM in autoencoder fashion for every environment in training environment.
@@ -232,6 +237,8 @@ def main(cfg: dict = config, run_dir: Path = Path("models")) -> None:
     # initalize IDM. This will be common to all environments
     input_dim: int = cfg["height"] * cfg["width"]
     idm: Encoder = Encoder(
+        height=cfg["height"],
+        width=cfg["width"],
         input_dim=input_dim,
         latent_dim=cfg["idm_latent_dim"]
     ).to(device)
@@ -241,6 +248,8 @@ def main(cfg: dict = config, run_dir: Path = Path("models")) -> None:
     for env in training_envs:
         decoders[env.spec.id] = Decoder(
             latent_dim=cfg["idm_latent_dim"],
+            height=cfg["height"],
+            width=cfg["width"],
             output_dim=input_dim
         ).to(device=device)
 
