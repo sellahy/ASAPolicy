@@ -27,6 +27,8 @@ import hashlib
 import json
 import os
 import random
+import signal
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +38,12 @@ import wandb
 from config import base_config
 from idm_training import main as train_idm
 from ppo_clip import run_all_agents, run_asa_transfer
+
+# SIGTERM handling (intended for enabling resuming sweeps on SLURM cluster)
+def handler(signum, frame):
+    wandb.run.mark_preempting()
+    sys.exit(128 + signum) 
+signal.signal(signal.SIGTERM, handler)
 
 
 # ---------------------------------------------------------------------------
@@ -156,39 +164,57 @@ def main() -> None:
         "--save_dir", type=str, default="figures",
         help="Directory to save plots (used when --skip-plot is not set)."
     )
+    parser.add_argument(
+        "--sweep", action="store_true", 
+        help=(
+            "indicates that this invocation of this file is part of a sweep "
+            "and overrides config hyperparams using sweep_config.yaml"
+        )
+    )
     args = parser.parse_args()
 
-    # Derive the run directory from the config hash before W&B init so that
-    # we can look up an existing W&B run ID for this config.
-    run_dir: Path = Path("runs") / config_hash(base_config)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    wandb_id_file: Path = run_dir / "wandb_run_id.txt"
-
-    if args.force:
-        # Remove all checkpoints so every stage re-runs
-        for f in run_dir.glob("*.pt"):
-            f.unlink()
-        if wandb_id_file.exists():
-            wandb_id_file.unlink()
-
-    # Resume the existing W&B run for this config if one was started before,
-    # so all metrics land on the same run page regardless of interruptions.
-    if wandb_id_file.exists():
-        existing_run_id: str = wandb_id_file.read_text().strip()
+    if args.sweep: # NOTE: in this block, force arg is ignored
         run = wandb.init(
-            project=base_config.get("project_name", "chess_asa"),
+            project=base_config.get("project_name"),
             entity=base_config.get("wandb_entity"),
-            id=existing_run_id,
-            resume="must",
             config=base_config,
         )
+        # sweep overrides are now applied
+        
+        run_dir: Path = Path("runs") / run.id
+        run_dir.mkdir(parents=True, exist_ok=True)
     else:
-        run = wandb.init(
-            project=base_config.get("project_name", "chess_asa"),
-            entity=base_config.get("wandb_entity"),
-            config=base_config,
-        )
-        wandb_id_file.write_text(run.id)
+        # Derive the run directory from the config hash before W&B init so that
+        # we can look up an existing W&B run ID for this config.
+        run_dir: Path = Path("runs") / config_hash(base_config)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        wandb_id_file: Path = run_dir / "wandb_run_id.txt"
+
+        if args.force:
+            # Remove all checkpoints so every stage re-runs
+            for f in run_dir.glob("*.pt"):
+                f.unlink()
+            if wandb_id_file.exists():
+                wandb_id_file.unlink()
+
+        # Resume the existing W&B run for this config if one was started before,
+        # so all metrics land on the same run page regardless of interruptions.
+        if wandb_id_file.exists():
+            existing_run_id: str = wandb_id_file.read_text().strip()
+            run = wandb.init(
+                project=base_config.get("project_name"),
+                entity=base_config.get("wandb_entity"),
+                id=existing_run_id,
+                resume="must",
+                config=base_config,
+            )
+        else:
+            run = wandb.init(
+                project=base_config.get("project_name"),
+                entity=base_config.get("wandb_entity"),
+                config=base_config,
+            )
+            wandb_id_file.write_text(run.id)
 
     config: dict = dict(run.config)
     set_seeds(config["seed"])
