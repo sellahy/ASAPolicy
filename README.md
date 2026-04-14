@@ -100,6 +100,14 @@ python run_experiment.py
 
 **Stage auto-detection**: completed stages are detected by the presence of their output checkpoints. Re-running the same command after an interruption automatically resumes from where it left off, reusing the same W&B run.
 
+Create sweep with following bash command:
+wandb sweep --project action_space_agnostic_agent sweep_config.yaml
+it will print a sweep_id to use in the following command. set for resuming with:
+wandb sweep entity/project/sweep_id --resume
+for a SLURM cluster, insert the sweep_id into launch_sweep.sh and run the following command to start the runs:
+sbatch launch_sweep.sh  
+If it gets interrupted, it can simply be rerun and it will continue where it left off.
+
 ### Flags
 
 | Flag | Effect |
