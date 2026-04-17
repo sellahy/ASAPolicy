@@ -19,8 +19,8 @@ idm_training_config_dict: dict = {
     "training_envs":  [
         "chess_env/ChessWorld-v0",
         "chess_env/BishopWorld-v0",
-        "chess_env/CamelWorld-v0",
-        "chess_env/GoldGeneralWorld-v0",
+        "chess_env/KingWorld-v0",
+        "chess_env/KnightWorld-v0",
     ],
     "dataset_size":   12800,
     "width":          5,
@@ -39,13 +39,13 @@ ppo_config_dict: dict = {
     "clip_epsilon":       0.2,
     "ppo_lr":             1e-3,       # separate from IDM lr to avoid key collision
     "eval_frequency":     10,         # episodes between in-training evaluations
-    "eval_episodes":      100,        # episodes per evaluation call
+    "eval_episodes":      20,         # episodes per evaluation call
 
     # ASA policy transformer architecture
     "latent_action_dim":  3,
     "transformer_nhead":  1,
     "transformer_layers": 1,
-    "dim_feedforward":    64,
+    "dim_feedforward":    300,
 
     # Environments the ASA agent trains on.
     # Must be the same environments that the IDM saw. That is, it is 
