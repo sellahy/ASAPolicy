@@ -37,7 +37,7 @@ import wandb
 
 from config import base_config
 from idm_training import main as train_idm
-from ppo_clip import run_all_agents, run_asa_transfer
+from ppo_clip import run_all_agents, run_asa_transfer, run_baseline_transfer
 
 # SIGTERM handling (intended for enabling resuming sweeps on SLURM cluster)
 def handler(signum, frame):
@@ -135,6 +135,53 @@ def _stage3_done(run_dir: Path, cfg: dict) -> bool:
     """Return True if all transfer policy checkpoints already exist."""
     return all((run_dir / f).exists() for f in _expected_transfer_files(cfg))
 
+
+def _expected_baseline_transfer_files(cfg: dict) -> list[str]:
+    """Return checkpoint filenames that stage 3b (baseline transfer) produces.
+
+    Replicates the matching logic from run_baseline_transfer so stage completion
+    can be checked without spawning any processes.
+
+    Args:
+        cfg: Experiment config dict.
+
+    Returns:
+        List of filename strings (not full paths). Empty list if no baselines
+        match any unseen environment.
+    """
+    import gymnasium as gym
+    import chess_env  # registers envs with gymnasium
+
+    size_to_source: dict[int, list[str]] = {}
+    for name in cfg["asa_envs"]:
+        env = gym.make(name, width=cfg["width"], height=cfg["height"])
+        size_to_source.setdefault(env.action_space.n, []).append(name)
+        env.close()
+
+    files: list[str] = []
+    unseen: list[str] = [n for n in cfg["all_envs"] if n not in cfg["asa_envs"]]
+    for target_name in unseen:
+        env = gym.make(target_name, width=cfg["width"], height=cfg["height"])
+        target_n: int = env.action_space.n
+        env.close()
+        for source_name in size_to_source.get(target_n, []):
+            source_tag: str = source_name.replace("chess_env/", "").replace("-v0", "")
+            target_tag: str = target_name.replace("chess_env/", "").replace("-v0", "")
+            agent_name: str = f"baseline_transfer_{source_tag}_to_{target_tag}"
+            files += [f"{agent_name}_policy.pt", f"{agent_name}_value.pt"]
+    return files
+
+
+def _stage3b_done(run_dir: Path, cfg: dict) -> bool:
+    """Return True if all baseline transfer checkpoints already exist.
+
+    Returns True immediately (treating the stage as vacuously complete) if no
+    training baseline has an action space matching any unseen environment.
+    """
+    files: list[str] = _expected_baseline_transfer_files(cfg)
+    if not files:
+        return True
+    return all((run_dir / f).exists() for f in files)
 
 # ---------------------------------------------------------------------------
 # Main entry point
@@ -254,6 +301,15 @@ def main() -> None:
     else:
         print("=== Stage 3: ASA transfer training ===")
         run_asa_transfer(config, str(run_dir))
+
+    # ------------------------------------------------------------------
+    # Stage 3b: Baseline transfer training on unseen environments
+    # ------------------------------------------------------------------
+    if _stage3b_done(run_dir, config) and not args.force:
+        print("=== Stage 3b: Skipped — all baseline transfer checkpoints already exist ===")
+    else:
+        print("=== Stage 3b: Baseline transfer training ===")
+        run_baseline_transfer(config, str(run_dir))
 
     # ------------------------------------------------------------------
     # Stage 4: W&B data (implicit — metrics logged live in stages 1-3)

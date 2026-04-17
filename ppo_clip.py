@@ -593,6 +593,32 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
                  agent_name=agent_name,
                  asa_env_names=asa_env_names)
 
+    elif agent_spec["type"] == "baseline_transfer":
+        # Load a trained baseline policy and fine-tune it on an unseen environment
+        # whose action space size matches the source baseline's action space.
+        # agent_spec["source_env_name"] identifies which checkpoint to load.
+        source_tag: str = (
+            agent_spec["source_env_name"]
+            .replace("chess_env/", "")
+            .replace("-v0", "")
+        )
+        policy = PolicyNetwork(state_dim, envs[0].action_space.n).to(device)
+        value_net: nn.Module = ValueNetwork(state_dim).to(device)
+        policy.load_state_dict(torch.load(
+            Path(run_dir) / f"{source_tag}_baseline_policy.pt",
+            map_location=device,
+            weights_only=False
+        ))
+        value_net.load_state_dict(torch.load(
+            Path(run_dir) / f"{source_tag}_baseline_value.pt",
+            map_location=device,
+            weights_only=False
+        ))
+        policy_opt = optim.Adam(policy.parameters(),    lr=config["ppo_lr"])
+        value_opt  = optim.Adam(value_net.parameters(), lr=config["ppo_lr"])
+        ppo_clip(policy, value_net, policy_opt, value_opt,
+                 envs, config, device, agent_name=agent_name)
+
     else:
         raise ValueError(f"Unknown agent type: {agent_spec['type']!r}")
 
@@ -657,6 +683,22 @@ def run_all_agents(config: dict, run_dir: str) -> None:
         p.join()
 
 
+def _action_space_size(env_name: str, cfg: dict) -> int:
+    """Return the action space size for env_name without keeping the env open.
+
+    Args:
+        env_name: Full gym env name (e.g. "chess_env/KingWorld-v0").
+        cfg:      Experiment config dict (must contain "width" and "height").
+
+    Returns:
+        Integer number of discrete actions.
+    """
+    env: gym.Env = gym.make(env_name, width=cfg["width"], height=cfg["height"])
+    n: int = env.action_space.n
+    env.close()
+    return n
+
+
 def run_asa_transfer(config: dict, run_dir: str) -> None:
     """For each unseen environment, independently load the trained ASA policy
     checkpoint and train on that single environment, recording the learning curve.
@@ -692,6 +734,85 @@ def run_asa_transfer(config: dict, run_dir: str) -> None:
         }
         for name in unseen_envs
     ]
+
+    run_id: str = wandb.run.id if wandb.run is not None else "local"
+    processes: list[mp.Process] = []
+
+    for rank, spec in enumerate(transfer_specs):
+        gpu_id: int = rank % num_gpus
+        p = mp.Process(
+            target=_train_worker,
+            args=(gpu_id, rank, config, spec, run_id, str(run_dir))
+        )
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+
+def run_baseline_transfer(config: dict, run_dir: str) -> None:
+    """For each unseen environment, find all trained baseline agents whose action
+    space size matches and fine-tune each one on that environment independently.
+
+    Matching is done at runtime by comparing ``action_space.n`` between each
+    training env (in ``config["asa_envs"]``) and each unseen env (in
+    ``config["all_envs"]`` but not ``config["asa_envs"]``). This keeps the logic
+    correct across grid-size sweeps or env additions without hardcoding.
+
+    If no trained baseline has a matching action space for a given unseen env,
+    a warning is printed and that env is skipped — no error is raised.
+
+    Each (source_baseline, target_env) pair produces one independent worker that
+    runs the full ``total_timesteps`` PPO budget starting from the trained
+    baseline checkpoint. Workers do not share state.
+
+    Metrics are logged to W&B under the namespace:
+        ``baseline_transfer_{source_tag}_to_{target_tag}/{target_tag}/{metric}``
+
+    Args:
+        config:  Full experiment config dict.
+        run_dir: Directory containing ``{source_tag}_baseline_policy.pt`` and
+                 ``{source_tag}_baseline_value.pt`` checkpoints from stage 2.
+    """
+    wandb.setup()  # required for W&B in spawned child processes
+
+    num_gpus: int = torch.cuda.device_count() or 1
+
+    # Map action space size -> list of training env names with that size.
+    size_to_source: dict[int, list[str]] = {}
+    for name in config["asa_envs"]:
+        n: int = _action_space_size(name, config)
+        size_to_source.setdefault(n, []).append(name)
+
+    unseen_envs: list[str] = [
+        name for name in config["all_envs"]
+        if name not in config["asa_envs"]
+    ]
+
+    transfer_specs: list[dict] = []
+    for target_name in unseen_envs:
+        target_n: int = _action_space_size(target_name, config)
+        sources: list[str] = size_to_source.get(target_n, [])
+        if not sources:
+            print(
+                f"[baseline_transfer] No matching baseline for {target_name} "
+                f"(action_space.n={target_n}). Skipping."
+            )
+            continue
+        for source_name in sources:
+            source_tag: str = source_name.replace("chess_env/", "").replace("-v0", "")
+            target_tag: str = target_name.replace("chess_env/", "").replace("-v0", "")
+            transfer_specs.append({
+                "type":            "baseline_transfer",
+                "env_names":       [target_name],
+                "source_env_name": source_name,
+                "agent_name":      f"baseline_transfer_{source_tag}_to_{target_tag}",
+            })
+
+    if not transfer_specs:
+        print("[baseline_transfer] No transfer pairs found. Nothing to do.")
+        return
 
     run_id: str = wandb.run.id if wandb.run is not None else "local"
     processes: list[mp.Process] = []
