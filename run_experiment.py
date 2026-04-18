@@ -37,7 +37,7 @@ import wandb
 
 from config import base_config
 from idm_training import main as train_idm
-from ppo_clip import run_all_agents, run_asa_transfer, run_baseline_transfer
+from ppo_clip import run_all_agents, run_asa_transfer, run_baseline_transfer, run_checkpoint_transfer
 
 # SIGTERM handling (intended for enabling resuming sweeps on SLURM cluster)
 def handler(signum, frame):
@@ -127,8 +127,91 @@ def _stage1_done(run_dir: Path) -> bool:
 
 
 def _stage2_done(run_dir: Path, cfg: dict) -> bool:
-    """Return True if all PPO policy checkpoints already exist."""
-    return all((run_dir / f).exists() for f in _expected_policy_files(cfg))
+    """Return True if all final and intermediate policy checkpoints exist."""
+    # Final checkpoints (existing check)
+    if not all((run_dir / f).exists() for f in _expected_policy_files(cfg)):
+        return False
+
+    # Intermediate checkpoints for each training agent
+    num_ckpts: int = cfg.get("num_checkpoints", 4)
+    total_ts: int  = cfg["total_timesteps"]
+    ckpt_steps: list[int] = sorted(set(
+        int(round(k * total_ts / num_ckpts))
+        for k in range(1, num_ckpts + 1)
+    ))
+
+    all_agents: list[str] = [
+        name.replace("chess_env/", "").replace("-v0", "") + "_baseline"
+        for name in cfg["training_envs"]
+    ] + ["asa_agent"]
+
+    for agent in all_agents:
+        for step in ckpt_steps[:-1]:  # skip last — covered by the final checkpoint
+            if not (run_dir / f"{agent}_policy_step{step}.pt").exists():
+                return False
+    return True
+
+
+def _checkpoint_transfer_agent_names(cfg: dict) -> list[str]:
+    """Return the agent names that run_checkpoint_transfer() will produce.
+
+    Mirrors the enumeration logic in run_checkpoint_transfer() so that
+    _stage3_checkpoint_done() can check completion without spawning processes.
+    """
+    import gymnasium as gym
+    import chess_env  # noqa: F401 — registers envs
+
+    num_ckpts: int = cfg.get("num_checkpoints", 4)
+    total_ts: int  = cfg["total_timesteps"]
+    ckpt_steps: list[int] = sorted(set(
+        int(round(k * total_ts / num_ckpts))
+        for k in range(1, num_ckpts + 1)
+    ))
+
+    unseen_envs: list[str] = [
+        name for name in cfg["all_envs"]
+        if name not in cfg["asa_envs"]
+    ]
+
+    # Action-space size map for baseline matching
+    size_to_source: dict[int, list[str]] = {}
+    for name in cfg["asa_envs"]:
+        env = gym.make(name, width=cfg["width"], height=cfg["height"])
+        size_to_source.setdefault(env.action_space.n, []).append(name)
+        env.close()
+
+    agent_names: list[str] = []
+
+    for ckpt_step in ckpt_steps:
+        for target_name in unseen_envs:
+            target_tag: str = target_name.replace("chess_env/", "").replace("-v0", "")
+            agent_names.append(f"asa_ckpt{ckpt_step}_transfer_{target_tag}")
+
+        for source_name in cfg["asa_envs"]:
+            source_tag: str = source_name.replace("chess_env/", "").replace("-v0", "")
+            env = gym.make(source_name, width=cfg["width"], height=cfg["height"])
+            source_n: int = env.action_space.n
+            env.close()
+            for target_name in unseen_envs:
+                env = gym.make(target_name, width=cfg["width"], height=cfg["height"])
+                target_n: int = env.action_space.n
+                env.close()
+                if target_n != source_n:
+                    continue
+                target_tag = target_name.replace("chess_env/", "").replace("-v0", "")
+                agent_names.append(
+                    f"{source_tag}_baseline_ckpt{ckpt_step}_transfer_{target_tag}"
+                )
+
+    return agent_names
+
+
+def _stage3_checkpoint_done(run_dir: Path, cfg: dict) -> bool:
+    """Return True if all checkpoint-transfer policy files exist."""
+    for agent_name in _checkpoint_transfer_agent_names(cfg):
+        if not (run_dir / f"{agent_name}_policy.pt").exists():
+            return False
+    return True
 
 
 def _stage3_done(run_dir: Path, cfg: dict) -> bool:
@@ -294,22 +377,47 @@ def main() -> None:
         run_all_agents(config, str(run_dir))
 
     # ------------------------------------------------------------------
-    # Stage 3: ASA transfer training on unseen environments
+    # Stage 3: Checkpoint-based transfer evaluation
+    # Compute T_transfer (minimum convergence timestep across all training
+    # agents) then fine-tune every (agent × checkpoint) pair on each unseen
+    # environment for exactly T_transfer timesteps.
     # ------------------------------------------------------------------
-    if _stage3_done(run_dir, config) and not args.force:
-        print("=== Stage 3: Skipped — all transfer checkpoints already exist ===")
-    else:
-        print("=== Stage 3: ASA transfer training ===")
-        run_asa_transfer(config, str(run_dir))
 
-    # ------------------------------------------------------------------
-    # Stage 3b: Baseline transfer training on unseen environments
-    # ------------------------------------------------------------------
-    if _stage3b_done(run_dir, config) and not args.force:
-        print("=== Stage 3b: Skipped — all baseline transfer checkpoints already exist ===")
+    # Compute and persist T_transfer so stage 3 can resume without re-querying
+    # W&B if interrupted.
+    t_transfer_file: Path = run_dir / "t_transfer.json"
+    if t_transfer_file.exists() and not args.force:
+        t_transfer: int = json.loads(t_transfer_file.read_text())["t_transfer"]
+        print(f"=== T_transfer loaded from file: {t_transfer} ===")
     else:
-        print("=== Stage 3b: Baseline transfer training ===")
-        run_baseline_transfer(config, str(run_dir))
+        from handle_data import get_min_convergence_step
+        training_agent_names: list[str] = [
+            name.replace("chess_env/", "").replace("-v0", "") + "_baseline"
+            for name in config["training_envs"]
+        ] + ["asa_agent"]
+        training_env_names: list[str] = [
+            name.replace("chess_env/", "")
+            for name in config["training_envs"]
+        ]
+        t_transfer = get_min_convergence_step(
+            run.id,
+            training_agent_names,
+            training_env_names,
+            total_timesteps=config["total_timesteps"],
+            threshold=config.get("transfer_relative_change_threshold", 0.25),
+        )
+        t_transfer_file.write_text(json.dumps({"t_transfer": t_transfer}))
+        print(f"=== T_transfer computed: {t_transfer} ===")
+
+    if _stage3_checkpoint_done(run_dir, config) and not args.force:
+        print("=== Stage 3: Skipped — all checkpoint transfer files exist ===")
+    else:
+        print(f"=== Stage 3: Checkpoint transfer (T_transfer={t_transfer}) ===")
+        try:
+            torch.multiprocessing.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass
+        run_checkpoint_transfer(config, str(run_dir), t_transfer)
 
     # ------------------------------------------------------------------
     # Stage 4: W&B data (implicit — metrics logged live in stages 1-3)
@@ -326,6 +434,7 @@ def main() -> None:
             plot_learning_curves,
             plot_loss_convergence_speed,
             plot_return_convergence_speed,
+            plot_transfer_vs_checkpoint_depth,
         )
         from handle_data import get_all_envs, get_config, load_run_as_dataframe
 

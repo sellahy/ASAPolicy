@@ -25,50 +25,11 @@ from handle_data import (
     get_runs,
     load_run_as_dataframe,
 )
+from utils import smooth
 
 
-# ---------------------------------------------------------------------------
-# Smoothing helper
-# ---------------------------------------------------------------------------
-
-def smooth(values: list[float], window: int = 11) -> np.ndarray:
-    """Centered moving average with truncated windows at the edges.
-
-    For each position i, averages over the largest centered window that fits
-    within the array bounds, up to the given window size. Boundary points use
-    a smaller window rather than being padded with zeros.
-
-    For even-sized windows, floor(window/2) points are taken to the left and
-    (window - floor(window/2) - 1) to the right, so interior points always
-    average exactly `window` values.
-
-    Example:
-        smooth([1, 2, 3, 4, 5], window=3) -> [1.5, 2.0, 3.0, 4.0, 4.5]
-          - i=0: avg([1, 2])    = 1.5  (only 1 right neighbour available)
-          - i=1: avg([1, 2, 3]) = 2.0  (full window)
-          - i=2: avg([2, 3, 4]) = 3.0  (full window)
-          - i=3: avg([3, 4, 5]) = 4.0  (full window)
-          - i=4: avg([4, 5])    = 4.5  (only 1 left neighbour available)
-
-    Args:
-        values: Sequence of scalar values to smooth.
-        window: Total window size. Should be a positive odd integer for
-                symmetric smoothing; even values are supported but produce a
-                slightly left-biased window.
-
-    Returns:
-        np.ndarray of the same length as values.
-    """
-    arr: np.ndarray = np.array(values, dtype=float)
-    n: int          = len(arr)
-    half_left: int  = window // 2
-    half_right: int = window - half_left - 1
-    smoothed: np.ndarray = np.empty(n)
-    for i in range(n):
-        start: int      = max(0, i - half_left)
-        end: int        = min(n - 1, i + half_right)
-        smoothed[i]     = arr[start : end + 1].mean()
-    return smoothed
+# smooth() is imported from utils.py; the implementation lives there so it
+# can be shared with handle_data.py without circular imports.
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +367,119 @@ def plot_hyperparam_sensitivity(df: pd.DataFrame,
 
 
 # ---------------------------------------------------------------------------
+# Plot 7 — Transfer performance vs. pretraining checkpoint depth
+# ---------------------------------------------------------------------------
+
+def plot_transfer_vs_checkpoint_depth(
+    df: pd.DataFrame,
+    unseen_envs: list[str],
+    save_dir: str = "figures",
+) -> None:
+    """Line chart: transfer return vs. pretraining checkpoint depth.
+
+    For each unseen environment, plots one line per source agent type (ASA vs.
+    each matching baseline).  The x-axis is the pretraining checkpoint timestep
+    and the y-axis is the mean return accumulated during the T_transfer
+    fine-tuning window (averaged over all logged eval events for that transfer
+    run), with ±1 SE error bands where multiple seeds are present.
+
+    Agent names in the DataFrame are expected to match the convention produced
+    by run_checkpoint_transfer():
+        asa_ckpt{step}_transfer_{target_env_tag}
+        {source_env_tag}_baseline_ckpt{step}_transfer_{target_env_tag}
+
+    Args:
+        df:          Tidy DataFrame from load_run_as_dataframe().
+        unseen_envs: List of short env tag strings to plot
+                     (e.g. ["GoldGeneral-v0", "SilverGeneral-v0"]).
+                     If a tag is not present in the data, its subplot is left
+                     empty rather than raising an error.
+        save_dir:    Directory to save the figure.
+    """
+    ret_df: pd.DataFrame = df[df["metric"] == "return"].copy()
+
+    # Parse checkpoint step and target env from agent_name.
+    # Pattern:  *_ckpt{step}_transfer_{target_env_tag}
+    import re
+    pattern = re.compile(r"^(.+)_ckpt(\d+)_transfer_(.+)$")
+
+    def _parse(agent_name: str):
+        m = pattern.match(agent_name)
+        if m:
+            return m.group(1), int(m.group(2)), m.group(3)
+        return None, None, None
+
+    parsed = ret_df["agent_name"].map(_parse)
+    ret_df["source_agent"] = parsed.map(lambda t: t[0] if t else None)
+    ret_df["ckpt_step"]    = parsed.map(lambda t: t[1] if t else None)
+    ret_df["target_env"]   = parsed.map(lambda t: t[2] if t else None)
+
+    # Keep only rows that matched the transfer naming pattern.
+    ret_df = ret_df.dropna(subset=["ckpt_step", "target_env"])
+    ret_df["ckpt_step"] = ret_df["ckpt_step"].astype(int)
+
+    if ret_df.empty:
+        print("[plot_transfer_vs_checkpoint_depth] No transfer data found; skipping.")
+        return
+
+    n_cols: int = min(4, len(unseen_envs)) # 4 is hard coded and refers to the number of metrics ppo_clip() in ppo_clip.py records by default
+    n_rows: int = -(-len(unseen_envs) // n_cols)
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(5 * n_cols, 4 * n_rows),
+        squeeze=False,
+    )
+
+    all_sources: np.ndarray = ret_df["source_agent"].unique()
+    colors: np.ndarray = plt.cm.tab10(np.linspace(0, 1, max(len(all_sources), 1)))
+    source_color: dict[str, np.ndarray] = dict(zip(all_sources, colors))
+
+    for idx, env_tag in enumerate(unseen_envs):
+        ax = axes[idx // n_cols][idx % n_cols]
+        env_df: pd.DataFrame = ret_df[ret_df["target_env"] == env_tag]
+
+        if env_df.empty:
+            ax.set_title(f"{env_tag}\n(no data)")
+            ax.set_visible(True)
+            continue
+
+        for source in sorted(env_df["source_agent"].unique()):
+            src_df: pd.DataFrame = (
+                env_df[env_df["source_agent"] == source]
+                .groupby("ckpt_step")["value"]
+                .agg(mean="mean", sem="sem")
+                .reset_index()
+                .sort_values("ckpt_step")
+            )
+            ax.plot(
+                src_df["ckpt_step"], src_df["mean"],
+                marker="o", label=source,
+                color=source_color.get(source),
+            )
+            ax.fill_between(
+                src_df["ckpt_step"],
+                src_df["mean"] - src_df["sem"],
+                src_df["mean"] + src_df["sem"],
+                alpha=0.2,
+                color=source_color.get(source),
+            )
+
+        ax.set_title(env_tag)
+        ax.set_xlabel("Pretraining checkpoint (timestep)")
+        ax.set_ylabel("Mean transfer return")
+        ax.legend(fontsize=7)
+
+    # Hide unused subplots
+    for idx in range(len(unseen_envs), n_rows * n_cols):
+        axes[idx // n_cols][idx % n_cols].set_visible(False)
+
+    fig.suptitle("Transfer Performance vs. Pretraining Depth", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(f"{save_dir}/transfer_vs_checkpoint_depth.png", dpi=150)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -445,6 +519,18 @@ def main() -> None:
     plot_asymptotic(df, K=K_late, save_dir=args.save_dir)
     plot_return_convergence_speed(df, threshold=thresh, save_dir=args.save_dir)
     plot_loss_convergence_speed(df, threshold=thresh, save_dir=args.save_dir)
+
+    # Transfer-vs-pretraining-depth plot: unseen envs are all envs in the run
+    # that have checkpoint-transfer data (identified by the _ckpt pattern).
+    import re
+    _ckpt_pattern = re.compile(r"_ckpt\d+_transfer_(.+)$")
+    unseen_env_tags: list[str] = sorted({
+        m.group(1)
+        for agent in df["agent_name"].unique()
+        if (m := _ckpt_pattern.search(str(agent)))
+    })
+    if unseen_env_tags:
+        plot_transfer_vs_checkpoint_depth(df, unseen_env_tags, save_dir=args.save_dir)
 
     if args.hyperparams:
         run_configs: dict[str, dict] = {rid: get_config(rid) for rid in get_runs()}

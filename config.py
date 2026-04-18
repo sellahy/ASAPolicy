@@ -56,6 +56,19 @@ ppo_config_dict: dict = {
     "jumpstart_K":           100,   # initial eval events that define jumpstart
     "asymptote_K":           100,   # final eval events that define asymptotic perf
     "convergence_threshold": 0.8,   # fraction of asymptote used for convergence speed
+
+    # Checkpoint-based transfer evaluation
+    "num_checkpoints":                  4,
+    # How many evenly-spaced intermediate checkpoints to save during PPO training.
+    # Checkpoint timesteps = [k * total_timesteps / num_checkpoints for k in 1..num_checkpoints].
+    # The final checkpoint at total_timesteps is always saved regardless.
+
+    "transfer_relative_change_threshold": 0.25,
+    # A metric is considered converged at the first point (i.e. after the last point
+    # where the criterion is violated) where the relative change between
+    # consecutive smoothed datapoints drops below this fraction.
+    # Used across all four logged metrics (return, ep_len, policy_loss, value_loss)
+    # when computing T_transfer.
 }
 
 # Guard against accidental key collisions before merging.

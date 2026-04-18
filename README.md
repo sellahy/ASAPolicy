@@ -28,6 +28,7 @@ The ASA policy is compared against per-environment baseline policies on three me
 ├── ppo_clip.py                 # PPO-Clip training, ASAPolicy, network definitions
 ├── handle_data.py              # W&B data retrieval utilities
 ├── plot_results.py             # Generates comparison figures from W&B data
+├── utils.py                    # Shared math utilities (smoothing, convergence helpers)
 ├── run_experiment.py           # Single entry point for the full pipeline
 ├── sweep_config.yaml           # W&B hyperparameter sweep configuration
 ├── requirements.txt            # Python dependencies
@@ -86,6 +87,16 @@ Key parameters to know before running:
 
 # Total PPO training budget per agent
 "total_timesteps": 200_000
+
+# Number of evenly-spaced intermediate checkpoints saved during PPO training.
+# Checkpoint timesteps = [k * total_timesteps / num_checkpoints for k in 1..num_checkpoints].
+"num_checkpoints": 4
+
+# Convergence criterion for computing T_transfer (the transfer fine-tuning budget).
+# A metric is converged at the first point (i.e. after the last violation) where
+# the relative change between consecutive smoothed datapoints drops below this fraction.
+# Applied to all four logged metrics (return, ep_len, policy_loss, value_loss).
+"transfer_relative_change_threshold": 0.15
 ```
 
 ---
@@ -120,8 +131,8 @@ If it gets interrupted, it can simply be rerun and it will continue where it lef
 ### Pipeline stages
 
 1. **IDM training** — trains a shared encoder and one decoder per environment on random-policy transition pairs. Saves `idm.pt` and `<env>_decoder.pt` to the run directory.
-2. **PPO training** — trains one baseline agent per environment and one ASA agent across `asa_envs`, in parallel across available GPUs. Saves `<agent>_policy.pt` checkpoints.
-3. **Transfer training** — for each environment the ASA agent did not train in, loads the saved ASA checkpoint fresh and trains on that environment independently. Measures jumpstart and transfer learning speed.
+2. **PPO training** — trains one baseline agent per environment and one ASA agent across `asa_envs`, in parallel across available GPUs. Saves final `<agent>_policy.pt` checkpoints plus `num_checkpoints` intermediate `<agent>_policy_step{N}.pt` checkpoints per agent.
+3. **Checkpoint transfer** — computes `T_transfer` (the minimum convergence timestep across all training agents, measured as the first stable point where the relative change between consecutive smoothed metric values drops below `transfer_relative_change_threshold` across all four logged metrics). Then, for every saved checkpoint of every training agent, fine-tunes that checkpoint on each unseen environment for exactly `T_transfer` timesteps. `T_transfer` is persisted to `t_transfer.json` so the stage can resume without re-querying W&B. The result is a transfer performance curve indexed by pretraining depth.
 4. **Data storage** — implicit; all metrics are logged live to W&B throughout stages 1–3.
 5. **Visualization** — generates comparison plots from W&B history and saves them locally.
 
@@ -132,13 +143,19 @@ Each run's files are stored under `runs/<wandb_run_id>/`:
 ```
 runs/
   <wandb_run_id>/
-    config.json               # Full resolved config for this run
-    wandb_run_id.txt          # Stored W&B run ID for resumption
-    idm.pt                    # Trained IDM encoder
-    <env>_decoder.pt          # Per-environment IDM decoders
-    <env>_baseline_policy.pt  # Baseline policy checkpoints
-    asa_agent_policy.pt       # Trained ASA policy
-    asa_transfer_<env>_policy.pt  # Transfer-trained ASA checkpoints
+    config.json                           # Full resolved config for this run
+    wandb_run_id.txt                      # Stored W&B run ID for resumption
+    t_transfer.json                       # Computed T_transfer budget for stage 3
+    idm.pt                                # Trained IDM encoder
+    <env>_decoder.pt                      # Per-environment IDM decoders
+    <env>_baseline_policy.pt              # Final baseline policy checkpoints
+    <env>_baseline_policy_step{N}.pt      # Intermediate baseline checkpoints
+    <env>_baseline_value_step{N}.pt       # Intermediate baseline value nets
+    asa_agent_policy.pt                   # Final trained ASA policy
+    asa_agent_policy_step{N}.pt           # Intermediate ASA checkpoints
+    asa_agent_value_step{N}.pt            # Intermediate ASA value nets
+    asa_ckpt{N}_transfer_<env>_policy.pt  # Checkpoint-transfer ASA results
+    <src>_baseline_ckpt{N}_transfer_<env>_policy.pt  # Checkpoint-transfer baseline results
 ```
 
 ---
@@ -151,7 +168,7 @@ Plots can be generated for any completed run at any time, independently of train
 python plot_results.py --run_id <wandb_run_id> --save_dir figures/
 ```
 
-This downloads the run's metric history from W&B and generates six figures:
+This downloads the run's metric history from W&B and generates seven figures:
 
 | Figure | What it shows |
 |---|---|
@@ -161,6 +178,8 @@ This downloads the run's metric history from W&B and generates six figures:
 | `return_convergence_speed.png` | First step where return reaches 80% of asymptote (lower = faster) |
 | `policy_loss_convergence_speed.png` | First step where policy loss drops to 80% of its initial value |
 | `value_loss_convergence_speed.png` | First step where value loss drops to 80% of its initial value |
+| `transfer_vs_checkpoint_depth.png` | Mean transfer return vs. pretraining checkpoint timestep per unseen environment — reveals whether more pretraining helps or hurts transfer |
+<!-- I'm not sure ^this^ is measuring what I want -->
 
 For hyperparameter sensitivity plots across a sweep:
 
@@ -205,6 +224,16 @@ NUM_AGENTS=4 bash -c '
 
 Each W&B agent repeatedly pulls a new hyperparameter configuration from the sweep server, runs the full `run_experiment.py` pipeline for that configuration, and reports results back. W&B's Bayesian optimizer uses completed results to suggest better configurations.
 
+The following keys can be added to `sweep_config.yaml` to sweep over the new checkpoint-transfer parameters:
+
+```yaml
+num_checkpoints:
+  values: [4]   # keep fixed unless checkpoint resolution is itself a research variable
+
+transfer_relative_change_threshold:
+  values: [0.25]
+```
+
 ---
 
 ## Data Utilities
@@ -225,7 +254,10 @@ envs = get_all_envs("abc123")
 
 # Load all metrics as a tidy DataFrame
 df = load_run_as_dataframe("abc123")
-# Columns: run_id, agent_name, env, metric, value, step
+# Columns: run_id, agent_name, env, metric, value, step, training_timestep
+# training_timestep is the actual PPO training timestep at which the eval was
+# logged (read from the same wandb.log() call as the metrics). NaN on rows
+# that originate from IDM training.
 ```
 
 ---

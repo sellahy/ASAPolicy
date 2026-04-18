@@ -48,6 +48,10 @@ parameters:
     values: [2, 3, 5]
   seed:
     values: [0, 1, 2, 3]
+  num_checkpoints:
+    values: [4]   # keep fixed unless checkpoint resolution is itself a research variable
+  transfer_relative_change_threshold:
+    values: [0.25]
 command:
   - ${env}
   - python

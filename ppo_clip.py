@@ -251,7 +251,9 @@ def ppo_clip(policy_net: nn.Module, value_net: nn.Module,
              config: dict,
              device: torch.device,
              agent_name: str = "agent",
-             asa_env_names: Optional[list[str]] = None) -> int:
+             asa_env_names: Optional[list[str]] = None,
+             checkpoint_dir: Optional[Path] = None,
+             checkpoint_steps: Optional[list[int]] = None) -> int:
     """Run PPO-Clip training for one agent.
 
     All metrics are logged to W&B under the namespace
@@ -271,6 +273,11 @@ def ppo_clip(policy_net: nn.Module, value_net: nn.Module,
         asa_env_names:     If provided, policy_net is treated as an ASAPolicy
                            and value_net must be a ConditionedValueNetwork.
                            Used to build per-step one-hot env ID vectors.
+        checkpoint_dir:    If provided, intermediate checkpoints are saved here
+                           at each timestep in checkpoint_steps.
+        checkpoint_steps:  Sorted list of training timesteps at which to save
+                           checkpoints. Each step is removed from the list once
+                           saved so it fires exactly once.
 
     Returns:
         Total number of training epochs completed.
@@ -282,6 +289,11 @@ def ppo_clip(policy_net: nn.Module, value_net: nn.Module,
     clip_epsilon: float   = config["clip_epsilon"]
     eval_frequency: int   = config["eval_frequency"]
     eval_episodes: int    = config["eval_episodes"]
+
+    # checkpoint_steps is passed by reference, so copy to prevent later 
+    # removal of steps from affecting other calls of ppo_clip
+    if checkpoint_steps is not None:
+        checkpoint_steps = checkpoint_steps.copy()
 
     # Whether this is an ASA agent with a ConditionedValueNetwork
     is_asa: bool = asa_env_names is not None
@@ -381,6 +393,19 @@ def ppo_clip(policy_net: nn.Module, value_net: nn.Module,
 
         timesteps_taken += len(rewards)
         epoch += 1
+
+        # Save intermediate checkpoints at the requested timestep milestones.
+        if checkpoint_dir is not None and checkpoint_steps:
+            ckpt_step = checkpoint_steps[0]
+            if timesteps_taken >= ckpt_step:
+                tag: str = f"step{ckpt_step}"
+                torch.save(policy_net.state_dict(),
+                            checkpoint_dir / f"{agent_name}_policy_{tag}.pt")
+                torch.save(value_net.state_dict(),
+                            checkpoint_dir / f"{agent_name}_value_{tag}.pt")
+                # once ckpt has been recorded at a checkpoint step, remove it
+                checkpoint_steps.remove(ckpt_step) 
+                wandb.log({f"{agent_name}/checkpoint_saved_at": ckpt_step})
 
         # eval once every eval_frequency epochs
         if epoch % eval_frequency == 0:
@@ -508,6 +533,15 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
     state_dim: int = config["height"] * config["width"]
     agent_name: str = agent_spec["agent_name"]
 
+    # Compute evenly-spaced checkpoint timesteps for this worker.
+    # use set for deduplication when num_checkpoints is > total_timesteps
+    num_ckpts: int = config.get("num_checkpoints", 4)
+    total_ts: int  = config["total_timesteps"]
+    _ckpt_steps: list[int] = sorted(set(
+        int(round(k * total_ts / num_ckpts))
+        for k in range(1, num_ckpts + 1)
+    ))
+
     if agent_spec["type"] == "baseline":
         env: gym.Env = envs[0]
         policy: nn.Module = PolicyNetwork(state_dim, env.action_space.n).to(device)
@@ -515,7 +549,9 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
         policy_opt = optim.Adam(policy.parameters(),    lr=config["ppo_lr"])
         value_opt  = optim.Adam(value_net.parameters(), lr=config["ppo_lr"])
         ppo_clip(policy, value_net, policy_opt, value_opt,
-                 envs, config, device, agent_name=agent_name)
+                 envs, config, device, agent_name=agent_name,
+                 checkpoint_dir=Path(run_dir),
+                 checkpoint_steps=list(_ckpt_steps))
 
     elif agent_spec["type"] == "asa":
         idm: Encoder = Encoder(
@@ -549,7 +585,9 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
         ppo_clip(policy, value_net, policy_opt, value_opt,
                  envs, config, device,
                  agent_name=agent_name,
-                 asa_env_names=asa_env_names)
+                 asa_env_names=asa_env_names,
+                 checkpoint_dir=Path(run_dir),
+                 checkpoint_steps=list(_ckpt_steps))
 
     elif agent_spec["type"] == "asa_transfer":
         idm = Encoder(
@@ -591,7 +629,9 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
         ppo_clip(policy, value_net, policy_opt, value_opt,
                  envs, config, device,
                  agent_name=agent_name,
-                 asa_env_names=asa_env_names)
+                 asa_env_names=asa_env_names,
+                 checkpoint_dir=Path(run_dir),
+                 checkpoint_steps=list(_ckpt_steps))
 
     elif agent_spec["type"] == "baseline_transfer":
         # Load a trained baseline policy and fine-tune it on an unseen environment
@@ -617,7 +657,82 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
         policy_opt = optim.Adam(policy.parameters(),    lr=config["ppo_lr"])
         value_opt  = optim.Adam(value_net.parameters(), lr=config["ppo_lr"])
         ppo_clip(policy, value_net, policy_opt, value_opt,
-                 envs, config, device, agent_name=agent_name)
+                 envs, config, device, agent_name=agent_name,
+                 checkpoint_dir=Path(run_dir),
+                 checkpoint_steps=list(_ckpt_steps))
+
+    elif agent_spec["type"] == "asa_checkpoint_transfer":
+        # Load a specific intermediate ASA checkpoint identified by
+        # agent_spec["checkpoint_step"], then fine-tune for t_transfer timesteps
+        # on the target (unseen) environment.
+        idm = Encoder(
+            height=config["height"],
+            width=config["width"],
+            input_dim=state_dim,
+            latent_dim=config["idm_latent_dim"]
+        ).to(device)
+        idm.load_state_dict(torch.load(
+            Path(run_dir) / "idm.pt", map_location=device, weights_only=False
+        ))
+        for p in idm.parameters():
+            p.requires_grad = False
+
+        asa_env_names = [
+            e.replace('chess_env/', '') for e in agent_spec["env_names"]
+        ]
+        policy = ASAPolicy(
+            idm,
+            latent_action_dim=config["latent_action_dim"],
+            dim_feedforward=config["dim_feedforward"],
+            state_dim=state_dim,
+            nhead=config["transformer_nhead"],
+            num_layers=config["transformer_layers"],
+        ).to(device)
+        ckpt_step: int = agent_spec["checkpoint_step"]
+        policy.load_state_dict(torch.load(
+            Path(run_dir) / f"asa_agent_policy_step{ckpt_step}.pt",
+            map_location=device,
+            weights_only=False
+        ))
+        policy.make_action_embeddings(envs, device)
+
+        value_net = ConditionedValueNetwork(state_dim, len(envs)).to(device)
+        policy_opt = optim.Adam(policy.parameters(),    lr=config["ppo_lr"])
+        value_opt  = optim.Adam(value_net.parameters(), lr=config["ppo_lr"])
+        # Use a worker-local config copy so t_transfer overrides total_timesteps
+        # without affecting other processes.
+        worker_config: dict = {**config, "total_timesteps": agent_spec["t_transfer"]}
+        ppo_clip(policy, value_net, policy_opt, value_opt,
+                 envs, worker_config, device,
+                 agent_name=agent_name,
+                 asa_env_names=asa_env_names)
+
+    elif agent_spec["type"] == "baseline_checkpoint_transfer":
+        # Load a specific intermediate baseline checkpoint and fine-tune for
+        # t_transfer timesteps on the target (unseen) environment.
+        source_tag: str = (
+            agent_spec["source_env_name"]
+            .replace("chess_env/", "")
+            .replace("-v0", "")
+        )
+        ckpt_step = agent_spec["checkpoint_step"]
+        policy = PolicyNetwork(state_dim, envs[0].action_space.n).to(device)
+        value_net: nn.Module = ValueNetwork(state_dim).to(device)
+        policy.load_state_dict(torch.load(
+            Path(run_dir) / f"{source_tag}_baseline_policy_step{ckpt_step}.pt",
+            map_location=device,
+            weights_only=False
+        ))
+        value_net.load_state_dict(torch.load(
+            Path(run_dir) / f"{source_tag}_baseline_value_step{ckpt_step}.pt",
+            map_location=device,
+            weights_only=False
+        ))
+        policy_opt = optim.Adam(policy.parameters(),    lr=config["ppo_lr"])
+        value_opt  = optim.Adam(value_net.parameters(), lr=config["ppo_lr"])
+        worker_config = {**config, "total_timesteps": agent_spec["t_transfer"]}
+        ppo_clip(policy, value_net, policy_opt, value_opt,
+                 envs, worker_config, device, agent_name=agent_name)
 
     else:
         raise ValueError(f"Unknown agent type: {agent_spec['type']!r}")
@@ -813,6 +928,125 @@ def run_baseline_transfer(config: dict, run_dir: str) -> None:
     if not transfer_specs:
         print("[baseline_transfer] No transfer pairs found. Nothing to do.")
         return
+
+    run_id: str = wandb.run.id if wandb.run is not None else "local"
+    processes: list[mp.Process] = []
+
+    for rank, spec in enumerate(transfer_specs):
+        gpu_id: int = rank % num_gpus
+        p = mp.Process(
+            target=_train_worker,
+            args=(gpu_id, rank, config, spec, run_id, str(run_dir))
+        )
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+
+def run_checkpoint_transfer(config: dict, run_dir: str, t_transfer: int) -> None:
+    """For every saved checkpoint of every training agent, fine-tune on each
+    unseen environment for t_transfer timesteps and log results to W&B.
+
+    Enumerates:
+      - ASA checkpoints: for each step in checkpoint_steps, if
+        ``asa_agent_policy_step{step}.pt`` exists, spawn one worker per
+        unseen environment (ASA is action-space agnostic so all unseen envs
+        are valid targets).
+      - Baseline checkpoints: for each training env and each checkpoint step,
+        if ``{env_tag}_baseline_policy_step{step}.pt`` exists, spawn one
+        worker per unseen env whose action_space.n matches the source.
+
+    Agent names logged to W&B follow the convention:
+        asa_ckpt{step}_transfer_{target_env_tag}
+        {source_env_tag}_baseline_ckpt{step}_transfer_{target_env_tag}
+
+    Args:
+        config:     Full experiment config dict.
+        run_dir:    Directory containing checkpoint .pt files and idm.pt.
+        t_transfer: Training timestep budget for each transfer worker.
+    """
+    wandb.setup()  # required for W&B in spawned child processes
+
+    num_gpus: int = torch.cuda.device_count() or 1
+    run_dir_path: Path = Path(run_dir)
+
+    num_ckpts: int = config.get("num_checkpoints", 4)
+    total_ts: int  = config["total_timesteps"]
+    ckpt_steps: list[int] = sorted(set(
+        int(round(k * total_ts / num_ckpts))
+        for k in range(1, num_ckpts + 1)
+    ))
+
+    unseen_envs: list[str] = [
+        name for name in config["all_envs"]
+        if name not in config["asa_envs"]
+    ]
+
+    # Map action space size -> list of asa_env names with that size (for
+    # baseline action-space matching).
+    size_to_source: dict[int, list[str]] = {}
+    for name in config["asa_envs"]:
+        n: int = _action_space_size(name, config)
+        size_to_source.setdefault(n, []).append(name)
+
+    transfer_specs: list[dict] = []
+
+    for ckpt_step in ckpt_steps:
+        # --- ASA checkpoints ---
+        # The final checkpoint (step == total_ts) uses the canonical name
+        # without the _step suffix, so check both naming patterns.
+        if ckpt_step == total_ts:
+            asa_ckpt_path: Path = run_dir_path / "asa_agent_policy.pt"
+        else:
+            asa_ckpt_path = run_dir_path / f"asa_agent_policy_step{ckpt_step}.pt"
+
+        if asa_ckpt_path.exists():
+            for target_name in unseen_envs:
+                target_tag: str = target_name.replace("chess_env/", "").replace("-v0", "")
+                transfer_specs.append({
+                    "type":            "asa_checkpoint_transfer",
+                    "env_names":       [target_name],
+                    "agent_name":      f"asa_ckpt{ckpt_step}_transfer_{target_tag}",
+                    "checkpoint_step": ckpt_step,
+                    "t_transfer":      t_transfer,
+                })
+        # QUESTION: how to handle asa checkpoint not existing?
+
+        # --- Baseline checkpoints ---
+        for source_name in config["asa_envs"]:
+            source_tag: str = source_name.replace("chess_env/", "").replace("-v0", "")
+            if ckpt_step == total_ts:
+                bl_ckpt_path: Path = run_dir_path / f"{source_tag}_baseline_policy.pt"
+            else:
+                bl_ckpt_path = run_dir_path / f"{source_tag}_baseline_policy_step{ckpt_step}.pt"
+
+            if not bl_ckpt_path.exists():
+                continue
+            # QUESTION: how to handle baseline checkpoint not existing?
+
+            source_n: int = _action_space_size(source_name, config)
+            for target_name in unseen_envs:
+                target_n: int = _action_space_size(target_name, config)
+                if target_n != source_n:
+                    continue
+                target_tag = target_name.replace("chess_env/", "").replace("-v0", "")
+                transfer_specs.append({
+                    "type":            "baseline_checkpoint_transfer",
+                    "env_names":       [target_name],
+                    "source_env_name": source_name,
+                    "agent_name":      f"{source_tag}_baseline_ckpt{ckpt_step}_transfer_{target_tag}",
+                    "checkpoint_step": ckpt_step,
+                    "t_transfer":      t_transfer,
+                })
+
+    if not transfer_specs:
+        print("[checkpoint_transfer] No checkpoint transfer pairs found. Nothing to do.")
+        return
+
+    print(f"[checkpoint_transfer] Spawning {len(transfer_specs)} transfer workers "
+          f"(t_transfer={t_transfer}).")
 
     run_id: str = wandb.run.id if wandb.run is not None else "local"
     processes: list[mp.Process] = []
