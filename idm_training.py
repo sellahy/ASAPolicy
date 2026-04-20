@@ -198,16 +198,17 @@ class Decoder(nn.Module):
 # zebra (3 tiles in cardinal direction, then 2 orthogonally)
 
 # loss function is BCE (since states are 0's where agent is not and a 1 where agent is), input s_t and s_t+1 and reconstruct it
-# TODO: make script that trains IDM then policy and records performance stats. Include hyperparam sweeps.
 
 
-def main(cfg: dict = config, run_dir: Path = Path("models")) -> None:
+def main(primary_run_id : str, run_dir: Path = Path("models"), cfg: dict = config) -> None:
     """Train the IDM encoder and per-environment decoders.
 
     Args:
-        cfg:     Full config dict. Defaults to the module-level idm_training_config_dict
-                 for backward-compatible standalone usage.
-        run_dir: Directory to save model checkpoints. Created if it doesn't exist.
+        primary_run_id:  global run id. Used for putting the wandb run that trains the 
+                         IDM into the same group as subsequent runs in the training pipeline
+        cfg:             Full config dict. Defaults to the module-level idm_training_config_dict
+                         for backward-compatible standalone usage.
+        run_dir:         Directory to save model checkpoints. Created if it doesn't exist.
     """
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -260,7 +261,12 @@ def main(cfg: dict = config, run_dir: Path = Path("models")) -> None:
     )
 
     # initialize wandb run
-    with wandb.init(project=cfg["project_name"], entity=cfg["wandb_entity"], config=cfg) as run:
+    with wandb.init(
+        project=cfg["project_name"], 
+        entity=cfg["wandb_entity"], 
+        config=cfg, 
+        group=primary_run_id
+        ) as run:
         # training loop
         num_epochs: int = cfg["epochs"]
         for epoch in range(num_epochs):

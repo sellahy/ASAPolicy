@@ -360,7 +360,7 @@ def main() -> None:
         print(f"=== Stage 1: Skipped — idm.pt already exists in {run_dir} ===")
     else:
         print("=== Stage 1: IDM training ===")
-        train_idm(config, run_dir)
+        train_idm(run.id, run_dir, config)
 
     # ------------------------------------------------------------------
     # Stage 2: PPO training of all agents
@@ -374,7 +374,7 @@ def main() -> None:
             torch.multiprocessing.set_start_method("spawn", force=True)
         except RuntimeError:
             pass  # start method already set
-        run_all_agents(config, str(run_dir))
+        run_all_agents(run.id, config, str(run_dir))
 
     # ------------------------------------------------------------------
     # Stage 3: Checkpoint-based transfer evaluation
@@ -390,7 +390,7 @@ def main() -> None:
         t_transfer: int = json.loads(t_transfer_file.read_text())["t_transfer"]
         print(f"=== T_transfer loaded from file: {t_transfer} ===")
     else:
-        from handle_data import get_min_convergence_step
+        from handle_data import get_min_convergence_step, load_group_as_dataframe
         training_agent_names: list[str] = [
             name.replace("chess_env/", "").replace("-v0", "") + "_baseline"
             for name in config["training_envs"]
@@ -399,13 +399,23 @@ def main() -> None:
             name.replace("chess_env/", "")
             for name in config["training_envs"]
         ]
+        # t_transfer = get_min_convergence_step(
+        #     run.id, # FIXME: this results in "KeyError: 'agent_name'" in handle_data.compute_convergence_step because the run_id being passed here is the run that recorded the IDM stats, not a run that recorded a baseline or ASAPolicy training
+        #     training_agent_names,
+        #     training_env_names,
+        #     total_timesteps=config["total_timesteps"],
+        #     threshold=config.get("transfer_relative_change_threshold", 0.25),
+        # )
+        group_df = load_group_as_dataframe(run.id)          # all worker runs share group=run.id
         t_transfer = get_min_convergence_step(
-            run.id,
-            training_agent_names,
-            training_env_names,
+            run_id=None,                                     # not used when df is passed directly
+            training_agent_names=training_agent_names,
+            training_env_names=training_env_names,
             total_timesteps=config["total_timesteps"],
             threshold=config.get("transfer_relative_change_threshold", 0.25),
-        )
+            _df=group_df,
+)
+
         t_transfer_file.write_text(json.dumps({"t_transfer": t_transfer}))
         print(f"=== T_transfer computed: {t_transfer} ===")
 
@@ -417,7 +427,7 @@ def main() -> None:
             torch.multiprocessing.set_start_method("spawn", force=True)
         except RuntimeError:
             pass
-        run_checkpoint_transfer(config, str(run_dir), t_transfer)
+        run_checkpoint_transfer(run.id, config, str(run_dir), t_transfer)
 
     # ------------------------------------------------------------------
     # Stage 4: W&B data (implicit — metrics logged live in stages 1-3)

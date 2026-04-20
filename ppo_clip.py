@@ -182,7 +182,7 @@ class ASAPolicy(torch.nn.Module):
             embedded_s.shape[0], 1, embedded_s.shape[1]
         )  # (batch_size, 1, latent_action_dim)
 
-        # FIXME: "Z_A_tensor.repeat(batched_embedded_s.shape[0], 1)" caused
+        # "Z_A_tensor.repeat(batched_embedded_s.shape[0], 1)" caused
         # "RuntimeError: Number of dimensions of repeat dims can not be smaller
         # than number of dimensions of tensor". Fixed by adding an additional 1.
         Z_A_to_cat: torch.Tensor = (
@@ -745,7 +745,7 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
     wandb.finish()
 
 
-def run_all_agents(config: dict, run_dir: str) -> None:
+def run_all_agents(primary_run_id : str, config: dict, run_dir: str) -> None:
     """Spawn one process per agent, assigned to GPUs round-robin.
 
     Trains one baseline agent per environment in training_envs, plus one ASA
@@ -754,6 +754,7 @@ def run_all_agents(config: dict, run_dir: str) -> None:
     GPUs — including fewer GPUs than agents.
 
     Args:
+        primary_run_id: run id of the primary wandb to group subsequent runs under.
         config:  Full experiment config dict.
         run_dir: Directory containing idm.pt and where checkpoints are saved.
     """
@@ -782,7 +783,7 @@ def run_all_agents(config: dict, run_dir: str) -> None:
     }
 
     agent_specs: list[dict] = baseline_specs + [asa_spec]
-    run_id: str = wandb.run.id if wandb.run is not None else "local"
+    run_id: str = primary_run_id
     processes: list[mp.Process] = []
 
     for rank, spec in enumerate(agent_specs):
@@ -814,7 +815,7 @@ def _action_space_size(env_name: str, cfg: dict) -> int:
     return n
 
 
-def run_asa_transfer(config: dict, run_dir: str) -> None:
+def run_asa_transfer(primary_run_id : str, config: dict, run_dir: str) -> None:
     """For each unseen environment, independently load the trained ASA policy
     checkpoint and train on that single environment, recording the learning curve.
 
@@ -829,8 +830,9 @@ def run_asa_transfer(config: dict, run_dir: str) -> None:
     action-space generalization.
 
     Args:
-        config:  Full experiment config dict.
-        run_dir: Directory containing asa_agent_policy.pt and idm.pt.
+        primary_run_id: run id of the primary wandb to group subsequent runs under.
+        config:         Full experiment config dict.
+        run_dir:        Directory containing asa_agent_policy.pt and idm.pt.
     """
     wandb.setup() # used because _train_worker initiates a run in a spawned instance (see https://docs.wandb.ai/models/track/log/distributed-training)
     
@@ -850,7 +852,7 @@ def run_asa_transfer(config: dict, run_dir: str) -> None:
         for name in unseen_envs
     ]
 
-    run_id: str = wandb.run.id if wandb.run is not None else "local"
+    run_id : str = primary_run_id
     processes: list[mp.Process] = []
 
     for rank, spec in enumerate(transfer_specs):
@@ -866,7 +868,7 @@ def run_asa_transfer(config: dict, run_dir: str) -> None:
         p.join()
 
 
-def run_baseline_transfer(config: dict, run_dir: str) -> None:
+def run_baseline_transfer(primary_run_id : str, config: dict, run_dir: str) -> None:
     """For each unseen environment, find all trained baseline agents whose action
     space size matches and fine-tune each one on that environment independently.
 
@@ -886,9 +888,10 @@ def run_baseline_transfer(config: dict, run_dir: str) -> None:
         ``baseline_transfer_{source_tag}_to_{target_tag}/{target_tag}/{metric}``
 
     Args:
-        config:  Full experiment config dict.
-        run_dir: Directory containing ``{source_tag}_baseline_policy.pt`` and
-                 ``{source_tag}_baseline_value.pt`` checkpoints from stage 2.
+        primary_run_id: run id of the primary wandb to group subsequent runs under.
+        config:         Full experiment config dict.
+        run_dir:        Directory containing ``{source_tag}_baseline_policy.pt`` and
+                        ``{source_tag}_baseline_value.pt`` checkpoints from stage 2.
     """
     wandb.setup()  # required for W&B in spawned child processes
 
@@ -929,7 +932,7 @@ def run_baseline_transfer(config: dict, run_dir: str) -> None:
         print("[baseline_transfer] No transfer pairs found. Nothing to do.")
         return
 
-    run_id: str = wandb.run.id if wandb.run is not None else "local"
+    run_id : str = primary_run_id
     processes: list[mp.Process] = []
 
     for rank, spec in enumerate(transfer_specs):
@@ -945,7 +948,7 @@ def run_baseline_transfer(config: dict, run_dir: str) -> None:
         p.join()
 
 
-def run_checkpoint_transfer(config: dict, run_dir: str, t_transfer: int) -> None:
+def run_checkpoint_transfer(primary_run_id : str, config: dict, run_dir: str, t_transfer: int) -> None:
     """For every saved checkpoint of every training agent, fine-tune on each
     unseen environment for t_transfer timesteps and log results to W&B.
 
@@ -963,9 +966,10 @@ def run_checkpoint_transfer(config: dict, run_dir: str, t_transfer: int) -> None
         {source_env_tag}_baseline_ckpt{step}_transfer_{target_env_tag}
 
     Args:
-        config:     Full experiment config dict.
-        run_dir:    Directory containing checkpoint .pt files and idm.pt.
-        t_transfer: Training timestep budget for each transfer worker.
+        primary_run_id: run id of the primary wandb to group subsequent runs under.
+        config:         Full experiment config dict.
+        run_dir:        Directory containing checkpoint .pt files and idm.pt.
+        t_transfer:     Training timestep budget for each transfer worker.
     """
     wandb.setup()  # required for W&B in spawned child processes
 
@@ -1048,7 +1052,7 @@ def run_checkpoint_transfer(config: dict, run_dir: str, t_transfer: int) -> None
     print(f"[checkpoint_transfer] Spawning {len(transfer_specs)} transfer workers "
           f"(t_transfer={t_transfer}).")
 
-    run_id: str = wandb.run.id if wandb.run is not None else "local"
+    run_id: str = primary_run_id
     processes: list[mp.Process] = []
 
     for rank, spec in enumerate(transfer_specs):

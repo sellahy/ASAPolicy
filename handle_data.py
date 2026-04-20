@@ -38,6 +38,22 @@ def get_runs() -> list[str]:
     return [run.id for run in _api.runs(PROJECT)]
 
 
+def get_runs_in_group(group_id: str) -> list[str]:
+    """Return run IDs belonging to the given W&B group."""
+    runs = _api.runs(PROJECT, filters={"group": group_id})
+    return [r.id for r in runs]
+
+
+def load_group_as_dataframe(group_id: str, max_samples: int = 10_000) -> pd.DataFrame:
+    """Concatenate metric history from all runs that share group_id."""
+    frames = [
+        load_run_as_dataframe(rid, max_samples)
+        for rid in get_runs_in_group(group_id)
+    ]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+
 def get_config(run_id: str) -> dict:
     """Return the config dict logged for the given run.
 
@@ -200,7 +216,7 @@ def compute_convergence_step(
     agent_name: str,
     env_name: str,
     total_timesteps: int,
-    threshold: float = 0.15,
+    threshold: float = 0.25,
 ) -> int:
     """Return the training timestep at which (agent_name, env_name) converged.
 
@@ -221,7 +237,7 @@ def compute_convergence_step(
                           (e.g. "KingWorld-v0").
         total_timesteps:  Fallback value used for any metric that never
                           converges.
-        threshold:        Relative change threshold (e.g. 0.15 = 15%).
+        threshold:        Relative change threshold (e.g. 0.25 = 25%).
 
     Returns:
         Integer training timestep.
@@ -257,12 +273,13 @@ def compute_convergence_step(
 
 
 def get_min_convergence_step(
-    run_id: str,
+    run_id: str | None,
     training_agent_names: list[str],
     training_env_names: list[str],
     total_timesteps: int,
-    threshold: float = 0.15,
+    threshold: float = 0.25,
     max_samples: int = 10_000,
+    _df: pd.DataFrame | None = None,
 ) -> int:
     """Return the minimum convergence timestep across all training agents.
 
@@ -293,7 +310,8 @@ def get_min_convergence_step(
     Returns:
         Integer training timestep to use as T_transfer.
     """
-    df: pd.DataFrame = load_run_as_dataframe(run_id, max_samples)
+    assert (_df is not None) ^ (run_id is not None), f"expected to be provided either run_id or a dataframe, but got {'both' if (_df is not None) and (run_id is not None) else 'neither'}"
+    df = _df if _df is not None else load_run_as_dataframe(run_id, max_samples)
 
     agent_convergences: list[int] = []
 
