@@ -46,6 +46,12 @@ parameters:
     values: [32, 64, 128, 256] # this is wrong. It needs to be changed so that the ASAPolicy has a similar parameter count to the baseline agents
   idm_latent_dim:
     values: [2, 3, 5]
+  n_transitions_per_action:
+    values: [5, 10, 20]
+  idm_d_model:
+    values: [32, 64, 128]
+  idm_num_layers:
+    values: [1, 2]
   seed:
     values: [0, 1, 2, 3]
   num_checkpoints:

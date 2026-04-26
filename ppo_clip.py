@@ -10,7 +10,7 @@ import numpy as np
 import gymnasium as gym
 import wandb
 import chess_env
-from idm_training import Encoder
+from idm_training import MultiTransitionEncoder, collect_n_transitions
 
 
 # ---------------------------------------------------------------------------
@@ -106,24 +106,27 @@ class ASAPolicy(torch.nn.Module):
         self.current_env: str = ""
 
     def make_action_embeddings(self, envs: list[gym.Env] | list[str],
-                               device: torch.device) -> None:
+                               device: torch.device,
+                               n_transitions: int = 10) -> None:
         """Build and store latent action embeddings for each environment.
 
-        For each environment and each action index, one transition is sampled
-        from a random starting state and passed through the frozen IDM encoder.
+        For each environment and each action index, N transitions are sampled
+        from random starting states and passed through the frozen IDM encoder.
         The resulting latent vector is stored as the embedding for that action.
 
-        VERY IMPORTANT: this is probably a massive area for improvement. Only a
-        single transition is used to make the latent actions — a single
-        random-start transition may not be representative of what the action
-        does across all starting positions.
+        Using N transitions (rather than 1) makes the embedding more robust:
+        the encoder must compress information from multiple starting states into
+        a single vector, capturing what the action *generally* does rather than
+        what it did from one particular state.
 
         Args:
-            envs:   List of gym.Env instances or env name strings to embed.
-            device: Device to run the IDM encoder on.
+            envs:         List of gym.Env instances or env name strings to embed.
+            device:       Device to run the IDM encoder on.
+            n_transitions: Number of transitions to collect per action. Should
+                           match the value used during IDM training.
         """
         # handle envs as name strings case
-        if type(envs[0]) == str:  # assumes all elements are either gym.Envs or strings
+        if isinstance(envs[0], str):
             gym_envs: list[gym.Env] = [gym.make(env_name) for env_name in envs]
         else:
             gym_envs = envs  # type: ignore[assignment]
@@ -137,14 +140,16 @@ class ASAPolicy(torch.nn.Module):
         for env in gym_envs:
             action_embeddings: list[torch.Tensor] = []
 
-            # use idm to make action embeddings. Add them in order of action indices.
-            for i in range(env.action_space.n):
-                s_t: np.ndarray = env.reset()[0]
-                s_tp1: np.ndarray = env.step(i)[0]
-                transition: torch.Tensor = torch.stack(
-                    [torch.tensor(s_t), torch.tensor(s_tp1)]
-                ).to(torch.float32).to(device)  # shape (2, height, width)
-                action_embeddings.append(self.idm(transition))
+            # use idm to make action embeddings. Add them in order of action indices
+            for action_idx in range(env.action_space.n):
+                # collect_n_transitions raises RuntimeError if max_attempts is
+                # exhausted
+                transitions: torch.Tensor = collect_n_transitions(
+                    env, action_idx, n_transitions
+                )
+                # transitions: (N, 2, C, H, W) → unsqueeze batch dim → (1, N, 2, C, H, W)
+                t: torch.Tensor = transitions.unsqueeze(0).to(device)
+                action_embeddings.append(self.idm(t))  # (1, latent_dim)
 
             self.Z_A[env.unwrapped.spec.id.replace('chess_env/', '')] = action_embeddings
 
@@ -273,11 +278,6 @@ def ppo_clip(policy_net: nn.Module, value_net: nn.Module,
         asa_env_names:     If provided, policy_net is treated as an ASAPolicy
                            and value_net must be a ConditionedValueNetwork.
                            Used to build per-step one-hot env ID vectors.
-        checkpoint_dir:    If provided, intermediate checkpoints are saved here
-                           at each timestep in checkpoint_steps.
-        checkpoint_steps:  Sorted list of training timesteps at which to save
-                           checkpoints. Each step is removed from the list once
-                           saved so it fires exactly once.
 
     Returns:
         Total number of training epochs completed.
@@ -290,7 +290,7 @@ def ppo_clip(policy_net: nn.Module, value_net: nn.Module,
     eval_frequency: int   = config["eval_frequency"]
     eval_episodes: int    = config["eval_episodes"]
 
-    # checkpoint_steps is passed by reference, so copy to prevent later 
+    # checkpoint_steps is passed by reference, so copy to prevent later
     # removal of steps from affecting other calls of ppo_clip
     if checkpoint_steps is not None:
         checkpoint_steps = checkpoint_steps.copy()
@@ -404,7 +404,7 @@ def ppo_clip(policy_net: nn.Module, value_net: nn.Module,
                 torch.save(value_net.state_dict(),
                             checkpoint_dir / f"{agent_name}_value_{tag}.pt")
                 # once ckpt has been recorded at a checkpoint step, remove it
-                checkpoint_steps.remove(ckpt_step) 
+                checkpoint_steps.remove(ckpt_step)
                 wandb.log({f"{agent_name}/checkpoint_saved_at": ckpt_step})
 
         # eval once every eval_frequency epochs
@@ -554,15 +554,21 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
                  checkpoint_steps=list(_ckpt_steps))
 
     elif agent_spec["type"] == "asa":
-        idm: Encoder = Encoder(
-            height=config["height"],
-            width=config["width"],
-            input_dim=state_dim,
-            latent_dim=config["idm_latent_dim"]
-        ).to(device)
-        idm.load_state_dict(torch.load(
+        checkpoint = torch.load(
             Path(run_dir) / "idm.pt", map_location=device, weights_only=False
-        ))
+        )
+        assert checkpoint.get("idm_version", 1) == 2, (
+            "idm.pt was produced by the old single-transition MLP encoder. "
+            "Delete it and re-run stage 1 with --force."
+        )
+        idm: MultiTransitionEncoder = MultiTransitionEncoder(
+            in_channels=config["obs_channels"],
+            latent_dim=config["idm_latent_dim"],
+            d_model=config["idm_d_model"],
+            nhead=config["idm_nhead"],
+            num_layers=config["idm_num_layers"],
+        ).to(device)
+        idm.load_state_dict(checkpoint["state_dict"])
         for p in idm.parameters():
             p.requires_grad = False
 
@@ -577,7 +583,10 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
             nhead=config["transformer_nhead"],
             num_layers=config["transformer_layers"],
         ).to(device)
-        policy.make_action_embeddings(envs, device)
+        policy.make_action_embeddings(
+            envs, device,
+            n_transitions=config["n_transitions_per_action"],
+        )
 
         value_net = ConditionedValueNetwork(state_dim, len(envs)).to(device)
         policy_opt = optim.Adam(policy.parameters(),    lr=config["ppo_lr"])
@@ -590,15 +599,21 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
                  checkpoint_steps=list(_ckpt_steps))
 
     elif agent_spec["type"] == "asa_transfer":
-        idm = Encoder(
-            height=config["height"],
-            width=config["width"],
-            input_dim=state_dim,
-            latent_dim=config["idm_latent_dim"]
-        ).to(device)
-        idm.load_state_dict(torch.load(
+        checkpoint = torch.load(
             Path(run_dir) / "idm.pt", map_location=device, weights_only=False
-        ))
+        )
+        assert checkpoint.get("idm_version", 1) == 2, (
+            "idm.pt was produced by the old single-transition MLP encoder. "
+            "Delete it and re-run stage 1 with --force."
+        )
+        idm = MultiTransitionEncoder(
+            in_channels=config["obs_channels"],
+            latent_dim=config["idm_latent_dim"],
+            d_model=config["idm_d_model"],
+            nhead=config["idm_nhead"],
+            num_layers=config["idm_num_layers"],
+        ).to(device)
+        idm.load_state_dict(checkpoint["state_dict"])
         for p in idm.parameters():
             p.requires_grad = False
 
@@ -621,7 +636,10 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
             map_location=device,
             weights_only=False
         ))
-        policy.make_action_embeddings(envs, device)
+        policy.make_action_embeddings(
+            envs, device,
+            n_transitions=config["n_transitions_per_action"],
+        )
 
         value_net = ConditionedValueNetwork(state_dim, len(envs)).to(device)
         policy_opt = optim.Adam(policy.parameters(),    lr=config["ppo_lr"])
@@ -629,9 +647,7 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
         ppo_clip(policy, value_net, policy_opt, value_opt,
                  envs, config, device,
                  agent_name=agent_name,
-                 asa_env_names=asa_env_names,
-                 checkpoint_dir=Path(run_dir),
-                 checkpoint_steps=list(_ckpt_steps))
+                 asa_env_names=asa_env_names)
 
     elif agent_spec["type"] == "baseline_transfer":
         # Load a trained baseline policy and fine-tune it on an unseen environment
@@ -665,15 +681,21 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
         # Load a specific intermediate ASA checkpoint identified by
         # agent_spec["checkpoint_step"], then fine-tune for t_transfer timesteps
         # on the target (unseen) environment.
-        idm = Encoder(
-            height=config["height"],
-            width=config["width"],
-            input_dim=state_dim,
-            latent_dim=config["idm_latent_dim"]
-        ).to(device)
-        idm.load_state_dict(torch.load(
+        checkpoint = torch.load(
             Path(run_dir) / "idm.pt", map_location=device, weights_only=False
-        ))
+        )
+        assert checkpoint.get("idm_version", 1) == 2, (
+            "idm.pt was produced by the old single-transition MLP encoder. "
+            "Delete it and re-run stage 1 with --force."
+        )
+        idm: MultiTransitionEncoder = MultiTransitionEncoder(
+            in_channels=config["obs_channels"],
+            latent_dim=config["idm_latent_dim"],
+            d_model=config["idm_d_model"],
+            nhead=config["idm_nhead"],
+            num_layers=config["idm_num_layers"],
+        ).to(device)
+        idm.load_state_dict(checkpoint["state_dict"])
         for p in idm.parameters():
             p.requires_grad = False
 
