@@ -29,6 +29,7 @@ import os
 import random
 import signal
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -59,6 +60,19 @@ def set_seeds(seed: int) -> None:
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
+
+
+# ---------------------------------------------------------------------------
+# time helper
+# ---------------------------------------------------------------------------
+
+def seconds_to_hms(time_in_seconds : float) -> tuple[int, int, int]:
+    """returns the total seconds in hours, minutes, and seconds"""
+    hours : int   = int( time_in_seconds // 3600)
+    minutes : int = int((time_in_seconds - hours*3600) // 60)
+    seconds : int = int((time_in_seconds - hours*3600 - minutes*60))
+
+    return hours, minutes, seconds
 
 
 # ---------------------------------------------------------------------------
@@ -356,15 +370,21 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Stage 1: IDM training
     # ------------------------------------------------------------------
+    start = time.time()
+
     if _stage1_done(run_dir) and not args.force:
         print(f"=== Stage 1: Skipped — idm.pt already exists in {run_dir} ===")
     else:
         print("=== Stage 1: IDM training ===")
         train_idm(run.id, run_dir, config)
 
+    end = time.time()
+    print(f"time taken for stage 1 is {seconds_to_hms(end - start)[0]} hours, {seconds_to_hms(end - start)[1]} minutes, {seconds_to_hms(end - start)[2]} seconds")
     # ------------------------------------------------------------------
     # Stage 2: PPO training of all agents
     # ------------------------------------------------------------------
+    start = time.time()
+
     if _stage2_done(run_dir, config) and not args.force:
         print("=== Stage 2: Skipped — all policy checkpoints already exist ===")
     else:
@@ -376,12 +396,16 @@ def main() -> None:
             pass  # start method already set
         run_all_agents(run.id, config, str(run_dir))
 
+    end = time.time()
+    print(f"time taken for stage 2 is {seconds_to_hms(end - start)[0]} hours, {seconds_to_hms(end - start)[1]} minutes, {seconds_to_hms(end - start)[2]} seconds")
+
     # ------------------------------------------------------------------
     # Stage 3: Checkpoint-based transfer evaluation
     # Compute T_transfer (minimum convergence timestep across all training
     # agents) then fine-tune every (agent × checkpoint) pair on each unseen
     # environment for exactly T_transfer timesteps.
     # ------------------------------------------------------------------
+    start = time.time()
 
     # Compute and persist T_transfer so stage 3 can resume without re-querying
     # W&B if interrupted.
@@ -429,6 +453,8 @@ def main() -> None:
             pass
         run_checkpoint_transfer(run.id, config, str(run_dir), t_transfer)
 
+    end = time.time()
+    print(f"time taken for stage 3 is {seconds_to_hms(end - start)[0]} hours, {seconds_to_hms(end - start)[1]} minutes, {seconds_to_hms(end - start)[2]} seconds")
     # ------------------------------------------------------------------
     # Stage 4: W&B data (implicit — metrics logged live in stages 1-3)
     # ------------------------------------------------------------------
