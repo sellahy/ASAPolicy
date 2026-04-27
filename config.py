@@ -1,6 +1,6 @@
 idm_training_config_dict: dict = {
     "seed":           42,
-    "epochs":         1000,
+    "epochs":         250,
     "lr":             1e-03,
     "batch_size":     128,
     "all_envs" : [
@@ -31,7 +31,7 @@ idm_training_config_dict: dict = {
 
     # Multi-transition encoder (new)
     "obs_channels":             1,    # OBS_CHANNELS_HOOK: 1 for chess grids, 3 for RGB robot
-    "n_transitions_per_action": 10,   # N transitions collected per (env, action) datum
+    "n_transitions_per_action": 20,   # N transitions collected per (env, action) datum
     "idm_d_model":              64,   # transformer d_model inside MultiTransitionEncoder
     "idm_nhead":                4,    # attention heads — must divide idm_d_model evenly
     "idm_num_layers":           2,    # number of TransformerEncoder layers
@@ -44,6 +44,7 @@ ppo_config_dict: dict = {
     "total_timesteps":    300_000,
     "gamma":              0.99,
     "clip_epsilon":       0.2,
+    "gae_lambda":         0.95,       # GAE λ; 0 = TD(0), 1 = full MC
     "ppo_lr":             1e-3,       # separate from IDM lr to avoid key collision
     "eval_frequency":     10,         # episodes between in-training evaluations
     "eval_episodes":      100,        # episodes per evaluation call

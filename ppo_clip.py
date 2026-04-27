@@ -1,4 +1,4 @@
-import time
+import sys
 from random import randrange
 from typing import Optional
 from pathlib import Path
@@ -287,6 +287,7 @@ def ppo_clip(policy_net: nn.Module, value_net: nn.Module,
     total_timesteps: int  = config["total_timesteps"]
     gamma: float          = config["gamma"]
     clip_epsilon: float   = config["clip_epsilon"]
+    gae_lambda: float     = config.get("gae_lambda", 0.95)
     eval_frequency: int   = config["eval_frequency"]
     eval_episodes: int    = config["eval_episodes"]
 
@@ -311,6 +312,8 @@ def ppo_clip(policy_net: nn.Module, value_net: nn.Module,
             pass  # baseline PolicyNetwork has no current_env attribute
 
         states: list[np.ndarray]  = []
+        next_states: list[np.ndarray] = []   # s_{t+1} for each step
+        terminateds: list[bool]       = []   # True only on true terminal, not truncation
         actions: list[int]        = []
         rewards: list[float]      = []
         log_probs_old: list[float] = []
@@ -341,6 +344,8 @@ def ppo_clip(policy_net: nn.Module, value_net: nn.Module,
             done = terminated or truncated
 
             states.append(state)
+            next_states.append(next_state)
+            terminateds.append(terminated)
             actions.append(action.item())
             rewards.append(reward)
             log_probs_old.append(log_prob.item())
@@ -349,28 +354,66 @@ def ppo_clip(policy_net: nn.Module, value_net: nn.Module,
 
             state = next_state
 
-        # Calculate discounted returns
-        returns: list[float] = []
-        discounted_return: float = 0.0
-        for r in reversed(rewards):
-            discounted_return = r + gamma * discounted_return
-            returns.insert(0, discounted_return)
-        returns_tensor: torch.Tensor = torch.FloatTensor(returns).to(device=device)
-
         # convert to numpy arrays first to silence the warning about slowness
         # of converting a list of np.ndarrays to torch.Tensor
         states_tensor: torch.Tensor = torch.FloatTensor(np.array(states)).to(device)
         actions_tensor: torch.Tensor = torch.LongTensor(np.array(actions)).to(device)
         log_probs_old_tensor: torch.Tensor = torch.FloatTensor(np.array(log_probs_old)).to(device)
+        next_states_tensor: torch.Tensor = torch.FloatTensor(
+            np.array(next_states)
+        ).to(device)
+        terminateds_tensor: torch.Tensor = torch.FloatTensor(
+            np.array(terminateds, dtype=np.float32)
+        ).to(device)   # shape (T,), 1.0 where terminal, 0.0 otherwise
+        rewards_tensor: torch.Tensor = torch.FloatTensor(
+            np.array(rewards)
+        ).to(device)
 
-        # Calculate advantages
+        # --- Compute V(s_t) with gradient (needed for value loss below) ---
         if is_asa:
             env_ids_tensor: torch.Tensor = torch.cat(env_ids, dim=0)  # (T, num_asa_envs)
             values: torch.Tensor = value_net(states_tensor, env_ids_tensor).squeeze(-1)
         else:
             values = value_net(states_tensor).squeeze(-1)
 
-        advantages: torch.Tensor = returns_tensor - values.detach()
+        # --- GAE advantage estimation ---
+        with torch.no_grad():
+            # Compute V(s_{t+1}) without gradient — used only for the TD target.
+            # values above keeps its gradient for the value loss.
+            if is_asa:
+                next_values_ng: torch.Tensor = value_net(
+                    next_states_tensor, env_ids_tensor
+                ).squeeze(-1)
+            else:
+                next_values_ng = value_net(next_states_tensor).squeeze(-1)
+
+            # delta_t = r_t + gamma*V(s_{t+1})·(1 − terminated_t) − V(s_t)
+            # The (1 − terminated_t) mask zeroes out the bootstrap at true
+            # terminal states while preserving it for truncated episodes.
+            deltas: torch.Tensor = (
+                rewards_tensor
+                + gamma * next_values_ng * (1.0 - terminateds_tensor)
+                - values.detach()
+            )
+
+            # Accumulate GAE backwards through time.
+            # The same mask stops advantage propagation across episode boundaries.
+            T: int = len(rewards)
+            advantages = torch.zeros(T, device=device)
+            gae: float = 0.0
+            for t in reversed(range(T)):
+                gae = deltas[t].item() + gamma * gae_lambda * gae * (
+                    1.0 - terminateds_tensor[t].item()
+                )
+                advantages[t] = gae
+
+        # GAE returns = advantage + V(s_t)
+        returns_tensor: torch.Tensor = advantages + values.detach()
+
+        # Normalize advantages: zero mean, unit std per rollout.
+        adv_mean = advantages.mean()
+        adv_std  = advantages.std(correction=0).clamp(min=1e-8)
+        advantages = (advantages - adv_mean) / adv_std
 
         # Update policy
         action_probs = policy_net(states_tensor)
