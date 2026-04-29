@@ -235,8 +235,9 @@ class ASAPolicy(torch.nn.Module):
         logits: torch.Tensor = torch.cosine_similarity(a, b).view(z_i.shape[0], -1)
 
         # logits + 1 shifts cosine similarities from [-1, 1] to [0, 2] to avoid negative values
+        shifted_logits = (logits + 1).clamp(min=0) # clamp to guard against very small negatives
         probability_distribution: torch.Tensor = (
-            (logits + 1) / torch.sum(logits + 1, dim=1, keepdim=True)
+            shifted_logits / torch.sum(shifted_logits, dim=1, keepdim=True)
         )  # (batch_size, num_actions)
 
         return probability_distribution
