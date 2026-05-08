@@ -252,14 +252,15 @@ class SharedDecoder(nn.Module):
     def __init__(self, latent_dim: int, out_channels: int) -> None:  # OBS_CHANNELS_HOOK
         super().__init__()
         self.out_channels = out_channels
+        self.upsample_scale_factor=2
 
         self.fc = nn.Linear(latent_dim, 64 * 2 * 2) # 64 is hardcoded hyperparam. Not sure where * 2 *2 came from
 
         self.deconv = nn.Sequential(
-            nn.Upsample(scale_factor=2),                               # → (B, 64, 4, 4)
+            nn.Upsample(scale_factor=self.upsample_scale_factor), # → (B, 64, 4, 4)
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Upsample(scale_factor=2),                               # → (B, 32, 8, 8) # NOTE: not convinced there is a need for height/width invariance
+            nn.Upsample(scale_factor=self.upsample_scale_factor), # → (B, 32, 8, 8) # NOTE: not convinced there is a need for height/width invariance
             nn.Conv2d(32, out_channels, kernel_size=3, padding=1),
             nn.Sigmoid(),   # output normalised to [0, 1] — matches obs_to_tensor range
         )

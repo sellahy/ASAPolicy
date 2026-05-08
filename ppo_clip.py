@@ -204,7 +204,7 @@ class ASAPolicy(torch.nn.Module):
         contextual_embeddings: torch.Tensor = self.transformer_encoder(s_and_Z_A)
         # (batch_size, num_actions + 1, latent_action_dim)
 
-        z_i: torch.Tensor = contextual_embeddings.mean(dim=1)  # (batch_size, latent_action_dim)
+        z_i: torch.Tensor = contextual_embeddings.mean(dim=1)  # (batch_size, latent_action_dim) # NOTE: unclear if mean pool is best way to aggregate the contextual embeddings
 
         probability_distribution: torch.Tensor = self.decoder(z_i, Z_A_tensor)
         # (batch_size, num_actions)
@@ -552,8 +552,6 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
         run_dir:    Local directory for saving model checkpoints.
     """
 
-    # time.sleep(rank_id * 120) # stagger wandb.inits between instances of _train_worker
-
     device: torch.device = torch.device(
         f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
     )
@@ -567,7 +565,6 @@ def _train_worker(gpu_id: int, rank_id: int, config: dict, agent_spec: dict,
         job_type=agent_spec["agent_name"],
         config=config,
         resume="allow",
-        # settings=wandb.Settings(init_timeout=120)
     )
 
     envs: list[gym.Env] = [
