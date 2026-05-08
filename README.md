@@ -31,8 +31,7 @@ The ASA policy is compared against per-environment baseline policies on three me
 ├── utils.py                    # Shared math utilities (smoothing, convergence helpers)
 ├── run_experiment.py           # Single entry point for the full pipeline
 ├── sweep_config.yaml           # W&B hyperparameter sweep configuration
-├── requirements.txt            # Python dependencies
-└── research.md                 # Technical notes and design rationale
+└── requirements.txt            # Python dependencies
 ```
 
 ---
@@ -41,8 +40,7 @@ The ASA policy is compared against per-environment baseline policies on three me
 
 ```bash
 # Clone the repository
-git clone <repo_url>
-cd ClassProject
+git clone https://github.com/sellahy/ASAPolicy.git
 
 # Install dependencies (includes the chess_env package in editable mode)
 pip install -r requirements.txt
@@ -86,7 +84,7 @@ Key parameters to know before running:
 "width": 5, "height": 5
 
 # Total PPO training budget per agent
-"total_timesteps": 200_000
+"total_timesteps": 300_000
 
 # Number of evenly-spaced intermediate checkpoints saved during PPO training.
 # Checkpoint timesteps = [k * total_timesteps / num_checkpoints for k in 1..num_checkpoints].
@@ -111,14 +109,6 @@ python run_experiment.py
 
 **Stage auto-detection**: completed stages are detected by the presence of their output checkpoints. Re-running the same command after an interruption automatically resumes from where it left off, reusing the same W&B run.
 
-Create sweep with following bash command:
-wandb sweep --project action_space_agnostic_agent sweep_config.yaml
-it will print a sweep_id to use in the following command. set for resuming with:
-wandb sweep entity/project/sweep_id --resume
-for a SLURM cluster, insert the sweep_id into launch_sweep.sh and run the following command to start the runs:
-sbatch launch_sweep.sh  
-If it gets interrupted, it can simply be rerun and it will continue where it left off.
-
 ### Flags
 
 | Flag | Effect |
@@ -133,8 +123,7 @@ If it gets interrupted, it can simply be rerun and it will continue where it lef
 1. **IDM training** — trains a shared encoder and one decoder per environment on random-policy transition pairs. Saves `idm.pt` and `<env>_decoder.pt` to the run directory.
 2. **PPO training** — trains one baseline agent per environment and one ASA agent across `asa_envs`, in parallel across available GPUs. Saves final `<agent>_policy.pt` checkpoints plus `num_checkpoints` intermediate `<agent>_policy_step{N}.pt` checkpoints per agent.
 3. **Checkpoint transfer** — computes `T_transfer` (the minimum convergence timestep across all training agents, measured as the first stable point where the relative change between consecutive smoothed metric values drops below `transfer_relative_change_threshold` across all four logged metrics). Then, for every saved checkpoint of every training agent, fine-tunes that checkpoint on each unseen environment for exactly `T_transfer` timesteps. `T_transfer` is persisted to `t_transfer.json` so the stage can resume without re-querying W&B. The result is a transfer performance curve indexed by pretraining depth.
-4. **Data storage** — implicit; all metrics are logged live to W&B throughout stages 1–3.
-5. **Visualization** — generates comparison plots from W&B history and saves them locally.
+4. **Visualization** — generates comparison plots from W&B history and saves them locally.
 
 ### Checkpoint and run directory layout
 
@@ -179,7 +168,6 @@ This downloads the run's metric history from W&B and generates seven figures:
 | `policy_loss_convergence_speed.png` | First step where policy loss drops to 80% of its initial value |
 | `value_loss_convergence_speed.png` | First step where value loss drops to 80% of its initial value |
 | `transfer_vs_checkpoint_depth.png` | Mean transfer return vs. pretraining checkpoint timestep per unseen environment — reveals whether more pretraining helps or hurts transfer |
-<!-- I'm not sure ^this^ is measuring what I want -->
 
 For hyperparameter sensitivity plots across a sweep:
 
@@ -193,46 +181,10 @@ python plot_results.py --run_id <any_run_id> \
 
 ## Hyperparameter Sweeps
 
-Sweeps use W&B's Bayesian optimization to search over the parameter space defined in `sweep_config.yaml`.
-
-```bash
-# Register the sweep with W&B (prints a sweep ID)
-wandb sweep sweep_config.yaml
-
-# Launch agents — NUM_AGENTS controls parallelism independently of GPU count.
-# Agents are assigned GPUs round-robin, so you can run more agents than GPUs.
-NUM_GPUS=$(nvidia-smi --list-gpus | wc -l || echo 1)
-NUM_AGENTS=${NUM_AGENTS:-$NUM_GPUS}   # default: one agent per GPU; override freely
-for i in $(seq 0 $((NUM_AGENTS - 1))); do
-  GPU_ID=$((i % NUM_GPUS))
-  CUDA_VISIBLE_DEVICES=$GPU_ID wandb agent <entity/project/sweep_id> &
-done
-wait
-```
-
-To run 4 agents on 2 GPUs:
-
-```bash
-NUM_AGENTS=4 bash -c '
-  NUM_GPUS=$(nvidia-smi --list-gpus | wc -l || echo 1)
-  for i in $(seq 0 $((NUM_AGENTS - 1))); do
-    CUDA_VISIBLE_DEVICES=$((i % NUM_GPUS)) wandb agent <sweep_id> &
-  done
-  wait
-'
-```
-
-Each W&B agent repeatedly pulls a new hyperparameter configuration from the sweep server, runs the full `run_experiment.py` pipeline for that configuration, and reports results back. W&B's Bayesian optimizer uses completed results to suggest better configurations.
-
-The following keys can be added to `sweep_config.yaml` to sweep over the new checkpoint-transfer parameters:
-
-```yaml
-num_checkpoints:
-  values: [4]   # keep fixed unless checkpoint resolution is itself a research variable
-
-transfer_relative_change_threshold:
-  values: [0.25]
-```
+Create sweep with following bash command:
+wandb sweep --project action_space_agnostic_agent sweep_config.yaml
+it will print a sweep_id to use in the following command. Set for resuming with the following CLI command:
+wandb sweep entity/project/sweep_id --resume
 
 ---
 
